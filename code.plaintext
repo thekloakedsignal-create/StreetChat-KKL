@@ -1,0 +1,11 @@
+app/
+  main.py, config.py, database.py, deps.py, schemas.py, prompt_loader.py
+  models/{user,resource,journal,candidate,conversation}.py
+  routers/{chat,sms,auth,admin,resources}.py
+  services/{chat_orchestrator,journal_service,retrieval,growth_agent,risk_scoring}.py
+  clients/{featherless,twilio_client,tools}.py
+prompts/{client,casemanager}_system.md + suffixes
+scripts/{init_db,seed_resources}.py
+data/seed/oc_resources_seed.json   (housing-first + core services, 100 real entries)
+tests/test_journal_isolation.py, test_health.py
+Dockerfile, render.yaml, docker-compose.yml, requirements.txt, README.md
