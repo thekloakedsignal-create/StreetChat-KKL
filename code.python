@@ -1,64 +1,69 @@
-import bcrypt
-import jwt
-from datetime import datetime, timedelta, timezone
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy.orm import Session
+"""Deterministic risk scoring for self-harm indicators.
 
-from app.config import settings
-from app.database import get_db
-from app.models.user import User
-from app.schemas import TokenData
+Never leave this to the model. Returns a score 0-100 plus which rule
+fired, so the response path is auditable and testable.
+"""
+import re
 
-security = HTTPBearer(auto_error=False)
+# Lethal ideation — highest weight
+INDICATORS_CRITICAL = [
+    (r"\b(want|plan|planning|going to|gonna)\s+(to\s+)?(kill|end)\s+(myself|me|it all)\b", 40),
+    (r"\b(kill|end)\s+(myself|it all)\b", 40),
+    (r"\bsuicid(e|al)\b", 40),
+    (r"\b(want|wish)\s+(to\s+)?die\b", 35),
+    (r"\b(end|take)\s+my\s+(own\s+)?life\b", 40),
+    (r"\bbetter\s+off\s+(dead|without me)\b", 35),
+    (r"\bno\s+(reason|point)\s+(to|in)\s+(living|going on)\b", 35),
+]
 
+# Passive ideation — moderate weight
+INDICATORS_CONCERN = [
+    (r"\btired\s+of\s+(living|fighting|this|existing)\b", 20),
+    (r"\bcan'?t\s+go\s+on\b", 20),
+    (r"\bwant\s+it\s+to\s+stop\b", 15),
+    (r"\bbeen\s+thinking\s+about\s+(it|ending)\b", 15),
+]
 
-def hash_password(plain: str) -> str:
-    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+# Negations dampen false positives
+NEGATIONS = [
+    r"\bnot\s+(going to|gonna)\b",
+    r"\bwouldn'?t\s+do\s+(it|that)\b",
+    r"\bused to\s+(think|feel)\s+(that|this) way\b",
+    r"\bin the past\b",
+    r"\bno plans?\b",
+]
 
-
-def verify_password(plain: str, hashed: str) -> bool:
-    try:
-        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
-    except Exception:
-        return False
-
-
-def create_access_token(user_id: int, role: str) -> str:
-    payload = TokenData(
-        sub=user_id,
-        role=role,
-        exp=datetime.now(timezone.utc) + timedelta(minutes=settings.jwt_expiry_minutes),
-        iat=datetime.now(timezone.utc),
-    )
-    return jwt.encode(payload.model_dump(), settings.jwt_secret, algorithm=settings.jwt_algorithm)
-
-
-def get_current_user(
-    creds: HTTPAuthorizationCredentials = Depends(security),
-    db: Session = Depends(get_db),
-) -> User:
-    if creds is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
-    try:
-        payload = jwt.decode(creds.credentials, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
-        user_id = int(payload["sub"])
-    except (jwt.InvalidTokenError, ValueError, KeyError):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    user = db.query(User).filter(User.id == user_id).first()
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-    return user
+HOTLINE_TEXT = (
+    "If you're thinking about hurting yourself, please reach out — "
+    "call or text 988 (Suicide & Crisis Lifeline) or text HOME to 741741 "
+    "(Crisis Text Line). They're free, 24/7, and they get it."
+)
 
 
-def get_current_user_optional(
-    creds: HTTPAuthorizationCredentials = Depends(security),
-    db: Session = Depends(get_db),
-):
-    """Authenticated or None — chat works either way, memory only when logged in."""
-    if creds is None:
-        return None
-    try:
-        return get_current_user(creds, db)
-    except HTTPException:
-        return None
+def score_risk(text: str) -> dict:
+    t = text.lower()
+    score = 0
+    fired = []
+
+    for pattern, weight in INDICATORS_CRITICAL:
+        if re.search(pattern, t):
+            score += weight
+            fired.append(f"critical:{pattern}")
+
+    for pattern, weight in INDICATORS_CONCERN:
+        if re.search(pattern, t):
+            score += weight
+            fired.append(f"concern:{pattern}")
+
+    for neg in NEGATIONS:
+        if re.search(neg, t):
+            score -= 10
+            fired.append(f"negation:{neg}")
+
+    score = max(0, min(score, 100))
+    return {
+        "score": score,
+        "indicators": fired,
+        "crisis_triggered": score >= 70,
+        "hotline": HOTLINE_TEXT if score >= 70 else None,
+    }
