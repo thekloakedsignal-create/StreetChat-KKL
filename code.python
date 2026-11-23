@@ -1,5 +1,46 @@
-from app.models.user import User
-from app.models.resource import Resource
-from app.models.journal import JournalEntry
-from app.models.candidate import ResourceCandidate
-from app.models.conversation import Conversation
+from datetime import datetime, timezone
+
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey
+from sqlalchemy.orm import relationship
+
+from app.database import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True)
+    username = Column(String(50), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    role = Column(String(20), nullable=False, default="client")  # client | case_manager | admin
+    recovery_question = Column(String(255), nullable=False)
+    recovery_answer_hash = Column(String(255), nullable=False)  # hashed like a password
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    profile = relationship("UserProfile", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    channels = relationship("UserChannel", back_populates="user", cascade="all, delete-orphan")
+
+
+class UserProfile(Base):
+    __tablename__ = "user_profiles"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
+    display_name = Column(String(100), nullable=True)
+    notes = Column(String(2000), nullable=True)  # user-visible bio/preferences only
+
+    user = relationship("User", back_populates="profile")
+
+
+class UserChannel(Base):
+    """Links a channel identifier (phone number) to an account. Phone is a channel, not identity."""
+    __tablename__ = "user_channels"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    channel = Column(String(20), nullable=False)  # "sms" | "web"
+    identifier = Column(String(50), nullable=False, index=True)  # E.164 phone for sms
+    active = Column(Boolean, default=True, nullable=False)
+    linked_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    user = relationship("User", back_populates="channels")
