@@ -1,89 +1,67 @@
-"""Runs web searches for OC homeless services and drops raw leads into
-resource_candidates. NOTHING here becomes user-visible until a human
-approves it in the admin review queue.
+"""Web search tool for the growth agent and (optionally) the model.
+
+Candidates ALWAYS go to the review queue — the bot never serves
+unverified web results directly to users.
 """
 import logging
-import re
 
-from sqlalchemy.orm import Session
+import httpx
 
-from app.clients.tools import web_search
-from app.models.candidate import ResourceCandidate
-from app.models.resource import Resource
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-SEARCH_TOPICS = [
-    "emergency shelter Orange County CA",
-    "transitional housing Orange County CA",
-    "food pantry Orange County CA free",
-    "free clinic Orange County CA uninsured",
-    "domestic violence shelter Orange County CA",
-    "youth homeless shelter Orange County CA",
-    "veterans homeless services Orange County CA",
-    "legal aid homeless Orange County CA",
-    "benefits enrollment CalFresh Orange County CA",
-    "shower laundry homeless Orange County CA",
-    "mental health services low income Orange County CA",
-    "substance use treatment Orange County CA low cost",
+TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Search the web for Orange County, CA homeless services. "
+                "Results are leads for staff review, not user-facing answers."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "max_results": {"type": "integer", "default": 5},
+                },
+                "required": ["query"],
+            },
+        },
+    }
 ]
 
-PHONE_RE = re.compile(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
+
+def web_search(query: str, max_results: int = 5) -> str:
+    if not settings.tavily_api_key:
+        return "Web search is not configured."
+    try:
+        resp = httpx.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": settings.tavily_api_key,
+                "query": query,
+                "max_results": max_results,
+                "search_depth": "basic",
+                "include_answer": True,
+            },
+            timeout=20.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        parts = []
+        if data.get("answer"):
+            parts.append(data["answer"])
+        for r in data.get("results", [])[:max_results]:
+            parts.append(f"- {r.get('title', '')}: {r.get('content', '')[:300]} ({r.get('url', '')})")
+        return "\n".join(parts) or "No results."
+    except Exception as e:
+        logger.warning(f"tavily search failed: {e}")
+        return "Search unavailable right now."
 
 
-def _norm(s: str | None) -> str:
-    return re.sub(r"\s+", "", (s or "").lower())
-
-
-def _is_duplicate(db: Session, name: str, phone: str | None) -> bool:
-    n = _norm(name)
-    if db.query(Resource).filter(Resource.name.ilike(f"%{name[:80]}%")).first():
-        return True
-    if db.query(ResourceCandidate).filter(
-        ResourceCandidate.status == "pending",
-        ResourceCandidate.name.ilike(f"%{name[:80]}%"),
-    ).first():
-        return True
-    if phone:
-        digits = re.sub(r"\D", "", phone)[-10:]
-        if digits and db.query(Resource).filter(Resource.phone.contains(digits)).first():
-            return True
-    return False
-
-
-def run_growth_agent(db: Session, topics: list[str] | None = None) -> dict:
-    added = skipped = errors = 0
-    for topic in (topics or SEARCH_TOPICS):
-        try:
-            results = web_search(topic)
-            if not results or "unavailable" in results.lower():
-                continue
-            # Naive extraction: each "- Title: ..." line becomes a candidate lead
-            for line in results.split("\n"):
-                line = line.strip("- ").strip()
-                if len(line) < 20 or ":" not in line:
-                    continue
-                title = line.split(":")[0][:250]
-                phone_m = PHONE_RE.search(line)
-                phone = phone_m.group(0) if phone_m else None
-                url_m = re.search(r"https?://\S+", line)
-                url = url_m.group(0).rstrip(").,>") if url_m else None
-                if _is_duplicate(db, title, phone):
-                    skipped += 1
-                    continue
-                db.add(ResourceCandidate(
-                    name=title,
-                    description=line[:1000],
-                    phone=phone,
-                    url=url,
-                    source_url=url,
-                    status="pending",
-                ))
-                db.commit()
-                added += 1
-        except Exception as e:
-            logger.warning(f"growth agent topic '{topic}' failed: {e}")
-            db.rollback()
-            errors += 1
-    logger.info(f"growth agent: +{added} candidates, {skipped} dupes, {errors} errors")
-    return {"added": added, "skipped": skipped, "errors": errors}
+def execute_tool(name: str, args: dict) -> str:
+    if name == "web_search":
+        return web_search(args.get("query", ""), args.get("max_results", 5))
+    return f"Unknown tool: {name}"
