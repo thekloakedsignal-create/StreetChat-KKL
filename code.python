@@ -1,62 +1,79 @@
-"""Web chat endpoints. Anonymous requests get RAG + crisis support but
-no memory; logged-in requests get the full journal pipeline.
+"""Auth: register, login, recovery. Recovery uses a personal question
+with the answer hashed like a password — no email/phone required,
+which is a firm requirement for this population.
 """
-import base64
 import logging
+import re
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.deps import get_current_user_optional
+from app.deps import hash_password, verify_password, create_access_token
 from app.models.user import User
-from app.schemas import ChatRequest, ChatImageRequest
-from app.services.chat_orchestrator import process_message
+from app.schemas import (
+    RegisterRequest, LoginRequest,
+    RecoverStartRequest, RecoverStartResponse, RecoverFinishRequest,
+    TokenResponse,
+)
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api", tags=["chat"])
+router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+USERNAME_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
 
 
-@router.get("/health")
-def health():
-    return {"status": "ok", "service": "streetchat"}
+def _normalize_answer(answer: str) -> str:
+    """Lowercase + strip non-alphanumerics so 'Main Street' == 'main street'."""
+    return re.sub(r"[^a-z0-9]+", " ", answer.lower()).strip()
 
 
-@router.post("/chat")
-async def chat(
-    req: ChatRequest,
-    db: Session = Depends(get_db),
-    user: User | None = Depends(get_current_user_optional),
-):
-    anon_key = req.anonymous_id or "anon:web"
-    result = await process_message(
-        db=db,
-        message=req.message,
-        channel="web",
-        channel_identifier=anon_key,
-        user=user,
+@router.post("/register", response_model=TokenResponse)
+def register(req: RegisterRequest, db: Session = Depends(get_db)):
+    uname = req.username.strip().lower()
+    if not USERNAME_RE.match(uname):
+        raise HTTPException(400, "Username: letters, numbers, hyphens, underscores only")
+    if db.query(User).filter(User.username == uname).first():
+        raise HTTPException(400, "Username already taken")
+
+    user = User(
+        username=uname,
+        password_hash=hash_password(req.password),
+        role="client",
+        recovery_question=req.recovery_question.strip()[:255],
+        recovery_answer_hash=hash_password(_normalize_answer(req.recovery_answer)),
     )
-    return result
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    logger.info(f"registered user id={user.id}")
+    return TokenResponse(access_token=create_access_token(user.id, user.role), role=user.role)
 
 
-@router.post("/chat/image")
-async def chat_image(
-    req: ChatImageRequest,
-    db: Session = Depends(get_db),
-    user: User | None = Depends(get_current_user_optional),
-):
-    try:
-        base64.b64decode(req.image_base64, validate=True)
-    except Exception:
-        return {"reply": "That image didn't upload right — try again?", "crisis": False}
+@router.post("/login", response_model=TokenResponse)
+def login(req: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == req.username.strip().lower()).first()
+    if not user or not verify_password(req.password, user.password_hash):
+        raise HTTPException(401, "Invalid username or password")
+    return TokenResponse(access_token=create_access_token(user.id, user.role), role=user.role)
 
-    anon_key = req.anonymous_id or "anon:web"
-    result = await process_message(
-        db=db,
-        message=req.message,
-        channel="web",
-        channel_identifier=anon_key,
-        user=user,
-        images=[{"data": req.image_base64, "media_type": req.media_type}],
-    )
-    return result
+
+@router.post("/recover/start", response_model=RecoverStartResponse)
+def recover_start(req: RecoverStartRequest, db: Session = Depends(get_db)):
+    """Return the recovery question if the account exists. Frontend must
+    render identically either way — don't leak which usernames exist."""
+    user = db.query(User).filter(User.username == req.username.strip().lower()).first()
+    return RecoverStartResponse(question=user.recovery_question if user else None)
+
+
+@router.post("/recover/finish", response_model=TokenResponse)
+def recover_finish(req: RecoverFinishRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == req.username.strip().lower()).first()
+    if not user:
+        raise HTTPException(400, "Recovery failed")
+    if not verify_password(_normalize_answer(req.answer), user.recovery_answer_hash):
+        raise HTTPException(400, "Recovery failed")
+    user.password_hash = hash_password(req.new_password)
+    db.commit()
+    logger.info(f"password reset via recovery for user id={user.id}")
+    return TokenResponse(access_token=create_access_token(user.id, user.role), role=user.role)
