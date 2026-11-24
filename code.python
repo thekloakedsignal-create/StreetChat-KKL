@@ -1,36 +1,137 @@
-"""Inbound MMS media needs HTTP Basic auth with account creds."""
-import base64
+"""Journal: the bot's long-term memory for each user.
+
+Two-layer design:
+  - "session" entries: short summary appended after each chat
+  - "rolling" entry: one compressed overview, rewritten when sessions pile up
+
+CRITICAL: every query filters on (user_id, role_scope). A human can hold
+both a client and a case-manager account pattern; their journals must
+never bleed into each other.
+"""
 import logging
+from sqlalchemy.orm import Session
 
-import httpx
-
-from app.config import settings
+from app.models.journal import JournalEntry
 
 logger = logging.getLogger(__name__)
 
+SESSION_ENTRIES_BEFORE_COMPRESS = 10
+ROLLING_MAX_CHARS = 2000
+SESSIONS_INJECTED = 5
 
-def fetch_media_base64(media_url: str) -> str | None:
-    """Download a Twilio media attachment and return base64 content."""
-    if not settings.twilio_account_sid or not settings.twilio_auth_token:
-        logger.warning("Twilio creds unset — cannot fetch media")
-        return None
-    try:
-        resp = httpx.get(
-            media_url,
-            auth=(settings.twilio_account_sid, settings.twilio_auth_token),
-            timeout=30.0,
-            follow_redirects=True,
+
+def get_memory_block(db: Session, user_id: int, role: str) -> str:
+    """Build the system-prompt memory section. Returns '' if no history."""
+    rolling = (
+        db.query(JournalEntry)
+        .filter(
+            JournalEntry.user_id == user_id,
+            JournalEntry.role_scope == role,
+            JournalEntry.entry_type == "rolling",
         )
-        resp.raise_for_status()
-        return base64.b64encode(resp.content).decode()
-    except Exception as e:
-        logger.warning(f"media fetch failed: {e}")
-        return None
+        .order_by(JournalEntry.created_at.desc())
+        .first()
+    )
+    sessions = (
+        db.query(JournalEntry)
+        .filter(
+            JournalEntry.user_id == user_id,
+            JournalEntry.role_scope == role,
+            JournalEntry.entry_type == "session",
+        )
+        .order_by(JournalEntry.created_at.desc())
+        .limit(SESSIONS_INJECTED)
+        .all()
+    )
+    sessions = list(reversed(sessions))  # chronological
+
+    parts = []
+    if rolling:
+        parts.append("WHAT YOU REMEMBER ABOUT THIS PERSON (from past conversations):")
+        parts.append(rolling.content[:ROLLING_MAX_CHARS])
+    if sessions:
+        parts.append("RECENT CONVERSATIONS:")
+        for s in sessions:
+            parts.append(f"[{s.created_at:%Y-%m-%d}] {s.content[:400]}")
+    return "\n".join(parts)
 
 
-def validate_signature(url: str, params: dict, signature: str) -> bool:
-    """Verify X-Twilio-Signature. Always False if token unset (fail closed)."""
-    if not settings.twilio_auth_token:
-        return False
-    from twilio.request_validator import RequestValidator
-    return RequestValidator(settings.twilio_auth_token).validate(url, params, signature)
+def add_session_entry(db: Session, user_id: int, role: str, summary: str, channel: str = "web"):
+    """Append a session summary, then compress into rolling if due."""
+    entry = JournalEntry(
+        user_id=user_id,
+        role_scope=role,
+        entry_type="session",
+        content=summary[:1200],
+    )
+    db.add(entry)
+    db.commit()
+
+    session_count = (
+        db.query(JournalEntry)
+        .filter(
+            JournalEntry.user_id == user_id,
+            JournalEntry.role_scope == role,
+            JournalEntry.entry_type == "session",
+        )
+        .count()
+    )
+    if session_count >= SESSION_ENTRIES_BEFORE_COMPRESS:
+        compress_rolling(db, user_id, role)
+
+
+def compress_rolling(db: Session, user_id: int, role: str):
+    """Fold all session entries into the rolling summary and clear them.
+
+    Simple deterministic compression: keep newest sessions verbatim up to
+    the char budget, since we don't want an extra LLM call in the chat path.
+    """
+    sessions = (
+        db.query(JournalEntry)
+        .filter(
+            JournalEntry.user_id == user_id,
+            JournalEntry.role_scope == role,
+            JournalEntry.entry_type == "session",
+        )
+        .order_by(JournalEntry.created_at.desc())
+        .all()
+    )
+    if not sessions:
+        return
+
+    rolling = (
+        db.query(JournalEntry)
+        .filter(
+            JournalEntry.user_id == user_id,
+            JournalEntry.role_scope == role,
+            JournalEntry.entry_type == "rolling",
+        )
+        .first()
+    )
+    existing = rolling.content if rolling else ""
+
+    chunks, budget = [], ROLLING_MAX_CHARS - len(existing) - 10
+    for s in sessions:
+        line = f"[{s.created_at:%Y-%m-%d}] {s.content[:250]}"
+        if len(line) > budget:
+            break
+        chunks.append(line)
+        budget -= len(line)
+
+    combined = (existing + "\n" + "\n".join(reversed(chunks))).strip()
+    combined = combined[-ROLLING_MAX_CHARS:]  # keep the newest if overflowing
+
+    if rolling:
+        rolling.content = combined
+    else:
+        db.add(JournalEntry(
+            user_id=user_id, role_scope=role,
+            entry_type="rolling", content=combined,
+        ))
+    for s in sessions[len(chunks):] if chunks else sessions:
+        # delete sessions we folded in (if none fit, fold all anyway)
+        db.delete(s)
+    for s in sessions[:len(chunks)]:
+        db.delete(s)
+    db.commit()
+    logger.info(f"journal compressed: user={user_id} role={role} folded={len(sessions)}")
