@@ -1,155 +1,89 @@
-"""The chat pipeline. Every message — web or SMS — flows through here.
-
-Order of operations:
-  1. Deterministic risk score (never trust the model with crisis)
-  2. Resolve user (linked account or anonymous)
-  3. Load journal memory block
-  4. RAG retrieval over verified resources
-  5. Assemble system prompt (persona + memory + RAG + suffixes)
-  6. Load recent conversation window
-  7. Call Featherless (with tool loop)
-  8. Persist conversation turns
-  9. Post-response journal summary (per user's design: update AFTER reply)
+"""Runs web searches for OC homeless services and drops raw leads into
+resource_candidates. NOTHING here becomes user-visible until a human
+approves it in the admin review queue.
 """
 import logging
-from datetime import datetime, timezone
+import re
 
 from sqlalchemy.orm import Session
 
-from app.models.conversation import Conversation
-from app.models.journal import JournalEntry
+from app.clients.tools import web_search
+from app.models.candidate import ResourceCandidate
 from app.models.resource import Resource
-from app.models.user import User, UserChannel
-from app.prompt_loader import (
-    casemanager_system_prompt,
-    client_system_prompt,
-    crisis_suffix,
-    sms_suffix,
-)
-from app.clients.featherless import chat as llm_chat, FeatherlessError
-from app.services.risk_scoring import score_risk
-from app.services.journal_service import get_memory_block, add_session_entry
-from app.services.retrieval import get_rag_context
 
 logger = logging.getLogger(__name__)
 
-HISTORY_WINDOW = 10  # messages each way
+SEARCH_TOPICS = [
+    "emergency shelter Orange County CA",
+    "transitional housing Orange County CA",
+    "food pantry Orange County CA free",
+    "free clinic Orange County CA uninsured",
+    "domestic violence shelter Orange County CA",
+    "youth homeless shelter Orange County CA",
+    "veterans homeless services Orange County CA",
+    "legal aid homeless Orange County CA",
+    "benefits enrollment CalFresh Orange County CA",
+    "shower laundry homeless Orange County CA",
+    "mental health services low income Orange County CA",
+    "substance use treatment Orange County CA low cost",
+]
+
+PHONE_RE = re.compile(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
 
 
-def _resolve_user_by_phone(db: Session, phone: str):
-    uc = (
-        db.query(UserChannel)
-        .filter(
-            UserChannel.channel == "sms",
-            UserChannel.identifier == phone,
-            UserChannel.active.is_(True),
-        )
-        .first()
-    )
-    if not uc:
-        return None
-    return db.query(User).filter(User.id == uc.user_id).first()
+def _norm(s: str | None) -> str:
+    return re.sub(r"\s+", "", (s or "").lower())
 
 
-def _load_history(db: Session, user_id, channel: str, identifier: str) -> list[dict]:
-    q = db.query(Conversation).filter(
-        Conversation.channel == channel,
-        Conversation.channel_identifier == identifier,
-    )
-    if user_id is not None:
-        q = q.filter(Conversation.user_id == user_id)
-    rows = q.order_by(Conversation.created_at.desc()).limit(HISTORY_WINDOW).all()
-    return [{"role": r.role, "content": r.content} for r in reversed(rows)]
+def _is_duplicate(db: Session, name: str, phone: str | None) -> bool:
+    n = _norm(name)
+    if db.query(Resource).filter(Resource.name.ilike(f"%{name[:80]}%")).first():
+        return True
+    if db.query(ResourceCandidate).filter(
+        ResourceCandidate.status == "pending",
+        ResourceCandidate.name.ilike(f"%{name[:80]}%"),
+    ).first():
+        return True
+    if phone:
+        digits = re.sub(r"\D", "", phone)[-10:]
+        if digits and db.query(Resource).filter(Resource.phone.contains(digits)).first():
+            return True
+    return False
 
 
-def _persist_turn(db: Session, user_id, channel: str, identifier: str,
-                  role: str, content: str):
-    db.add(Conversation(
-        user_id=user_id, channel=channel,
-        channel_identifier=identifier, role=role, content=content[:4000],
-    ))
-    db.commit()
-
-
-def _summarize_for_journal(messages: list[dict], reply: str) -> str:
-    """Cheap deterministic session summary — topics + any resources named.
-    Intentionally not an LLM call; keeps the chat path fast and private."""
-    user_text = " ".join(m["content"] for m in messages if m["role"] == "user")
-    words = [w for w in user_text.split() if len(w) > 4][:40]
-    topics = ", ".join(sorted(set(w.lower().strip(".,!?")) for w in words)[:12])
-    return f"Topics: {topics}. Bot suggested: {reply[:250]}"
-
-
-async def process_message(
-    db: Session,
-    message: str,
-    channel: str,                # "web" | "sms"
-    channel_identifier: str,     # phone number or session/anon key
-    user: User | None = None,    # authed web user, if any
-    phone: str | None = None,    # for SMS user resolution
-    images: list[dict] | None = None,
-) -> dict:
-    risk = score_risk(message)
-
-    # Resolve account for SMS from phone number
-    if user is None and phone:
-        user = _resolve_user_by_phone(db, phone)
-
-    user_id = user.id if user else None
-    role = user.role if user else "client"
-
-    # Memory + RAG (only when we know who this is)
-    memory = get_memory_block(db, user_id, role) if user_id else ""
-    rag = get_rag_context(db, message)
-
-    # Persona
-    system_parts = [
-        casemanager_system_prompt() if role == "case_manager" else client_system_prompt()
-    ]
-    if memory:
-        system_parts.append(memory)
-    if rag:
-        system_parts.append(rag)
-    if risk["crisis_triggered"]:
-        system_parts.append(crisis_suffix())
-    if channel == "sms":
-        system_parts.append(sms_suffix())
-
-    messages = [{"role": "system", "content": "\n\n".join(system_parts)}]
-    if user_id:
-        messages.extend(_load_history(db, user_id, channel, channel_identifier))
-    messages.append({"role": "user", "content": message})
-
-    try:
-        reply = llm_chat(messages, use_tools=True, images=images)
-    except FeatherlessError as e:
-        logger.error(f"LLM call failed: {e}")
-        reply = ("I'm having trouble connecting right now. If this is urgent, "
-                 "call or text 988, or dial 2-1-1 for Orange County services.")
-
-    if risk["crisis_triggered"] and risk.get("hotline") and risk["hotline"] not in reply:
-        reply = f"{risk['hotline']}\n\n{reply}"
-
-    # Persist both turns
-    try:
-        _persist_turn(db, user_id, channel, channel_identifier, "user", message)
-        _persist_turn(db, user_id, channel, channel_identifier, "assistant", reply)
-    except Exception as e:
-        logger.warning(f"conversation persist failed: {e}")
-        db.rollback()
-
-    # Journal AFTER the reply (by design)
-    if user_id:
+def run_growth_agent(db: Session, topics: list[str] | None = None) -> dict:
+    added = skipped = errors = 0
+    for topic in (topics or SEARCH_TOPICS):
         try:
-            summary = _summarize_for_journal(messages, reply)
-            add_session_entry(db, user_id, role, summary, channel)
+            results = web_search(topic)
+            if not results or "unavailable" in results.lower():
+                continue
+            # Naive extraction: each "- Title: ..." line becomes a candidate lead
+            for line in results.split("\n"):
+                line = line.strip("- ").strip()
+                if len(line) < 20 or ":" not in line:
+                    continue
+                title = line.split(":")[0][:250]
+                phone_m = PHONE_RE.search(line)
+                phone = phone_m.group(0) if phone_m else None
+                url_m = re.search(r"https?://\S+", line)
+                url = url_m.group(0).rstrip(").,>") if url_m else None
+                if _is_duplicate(db, title, phone):
+                    skipped += 1
+                    continue
+                db.add(ResourceCandidate(
+                    name=title,
+                    description=line[:1000],
+                    phone=phone,
+                    url=url,
+                    source_url=url,
+                    status="pending",
+                ))
+                db.commit()
+                added += 1
         except Exception as e:
-            logger.warning(f"journal update failed: {e}")
+            logger.warning(f"growth agent topic '{topic}' failed: {e}")
             db.rollback()
-
-    return {
-        "reply": reply,
-        "crisis": risk["crisis_triggered"],
-        "risk_score": risk["score"],
-        "identified": user_id is not None,
-    }
+            errors += 1
+    logger.info(f"growth agent: +{added} candidates, {skipped} dupes, {errors} errors")
+    return {"added": added, "skipped": skipped, "errors": errors}
