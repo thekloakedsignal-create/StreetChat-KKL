@@ -1,43 +1,82 @@
-"""StreetChat — standalone RAG companion chatbot for OC homelessness support.
-Module entrypoint: uvicorn app.main:app
+"""Admin: candidate review queue + growth agent trigger.
+Guarded by a static API key header (X-Admin-Key), separate from user JWTs.
 """
 import logging
+from datetime import datetime, timezone
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
+from fastapi import APIRouter, Depends, Header, HTTPException
+from sqlalchemy.orm import Session
 
-from app.database import Base, engine
-from app.routers import admin, auth, chat, resources, sms
+from app.config import settings
+from app.database import get_db
+from app.models.candidate import ResourceCandidate
+from app.models.resource import Resource
+from app.schemas import CandidateOut, ReviewRequest
+from app.services.growth_agent import run_growth_agent
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-
-limiter = Limiter(key_func=get_remote_address)
-
-app = FastAPI(title="StreetChat", version="1.0.0")
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # tighten to your domain in production
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-app.include_router(auth.router)
-app.include_router(chat.router)
-app.include_router(sms.router)
-app.include_router(resources.router)
-app.include_router(admin.router)
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/admin", tags=["admin"])
 
 
-@app.on_event("startup")
-def create_tables():
-    Base.metadata.create_all(bind=engine)
+def require_admin(x_admin_key: str = Header(default="")):
+    if not settings.admin_api_key or x_admin_key != settings.admin_api_key:
+        raise HTTPException(401, "Invalid admin key")
 
 
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
+@router.get("/candidates", response_model=list[CandidateOut], dependencies=[Depends(require_admin)])
+def list_candidates(status: str = "pending", db: Session = Depends(get_db)):
+    return (
+        db.query(ResourceCandidate)
+        .filter(ResourceCandidate.status == status)
+        .order_by(ResourceCandidate.found_at.desc())
+        .limit(200)
+        .all()
+    )
+
+
+@router.post("/candidates/{cid}/approve", response_model=CandidateOut, dependencies=[Depends(require_admin)])
+def approve(cid: int, req: ReviewRequest, db: Session = Depends(get_db)):
+    c = db.query(ResourceCandidate).filter(ResourceCandidate.id == cid).first()
+    if not c:
+        raise HTTPException(404, "not found")
+    c.status = "approved"
+    c.reviewer_notes = req.notes
+    c.reviewed_at = datetime.now(timezone.utc)
+
+    # Promote to verified Resource
+    resource = Resource(
+        name=c.name,
+        description=c.description,
+        address=c.address,
+        city=c.city,
+        phone=c.phone,
+        url=c.url,
+        hours=c.hours,
+        eligibility=c.eligibility,
+        service_types=[t.strip().lower() for t in (c.service_types or "").split(",") if t.strip()],
+        source_url=c.source_url,
+        verified=True,
+    )
+    db.add(resource)
+    db.commit()
+    db.refresh(c)
+    logger.info(f"candidate {cid} approved -> resource {resource.id}")
+    return c
+
+
+@router.post("/candidates/{cid}/reject", response_model=CandidateOut, dependencies=[Depends(require_admin)])
+def reject(cid: int, req: ReviewRequest, db: Session = Depends(get_db)):
+    c = db.query(ResourceCandidate).filter(ResourceCandidate.id == cid).first()
+    if not c:
+        raise HTTPException(404, "not found")
+    c.status = "rejected"
+    c.reviewer_notes = req.notes
+    c.reviewed_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(c)
+    return c
+
+
+@router.post("/growth/run", dependencies=[Depends(require_admin)])
+def run_growth(db: Session = Depends(get_db)):
+    return run_growth_agent(db)
