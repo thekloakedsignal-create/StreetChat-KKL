@@ -1,67 +1,43 @@
-"""Web search tool for the growth agent and (optionally) the model.
-
-Candidates ALWAYS go to the review queue — the bot never serves
-unverified web results directly to users.
+"""StreetChat — standalone RAG companion chatbot for OC homelessness support.
+Module entrypoint: uvicorn app.main:app
 """
 import logging
 
-import httpx
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
-from app.config import settings
+from app.database import Base, engine
+from app.routers import admin, auth, chat, resources, sms
 
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
-TOOL_SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": (
-                "Search the web for Orange County, CA homeless services. "
-                "Results are leads for staff review, not user-facing answers."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "max_results": {"type": "integer", "default": 5},
-                },
-                "required": ["query"],
-            },
-        },
-    }
-]
+limiter = Limiter(key_func=get_remote_address)
 
+app = FastAPI(title="StreetChat", version="1.0.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-def web_search(query: str, max_results: int = 5) -> str:
-    if not settings.tavily_api_key:
-        return "Web search is not configured."
-    try:
-        resp = httpx.post(
-            "https://api.tavily.com/search",
-            json={
-                "api_key": settings.tavily_api_key,
-                "query": query,
-                "max_results": max_results,
-                "search_depth": "basic",
-                "include_answer": True,
-            },
-            timeout=20.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        parts = []
-        if data.get("answer"):
-            parts.append(data["answer"])
-        for r in data.get("results", [])[:max_results]:
-            parts.append(f"- {r.get('title', '')}: {r.get('content', '')[:300]} ({r.get('url', '')})")
-        return "\n".join(parts) or "No results."
-    except Exception as e:
-        logger.warning(f"tavily search failed: {e}")
-        return "Search unavailable right now."
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # tighten to your domain in production
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(auth.router)
+app.include_router(chat.router)
+app.include_router(sms.router)
+app.include_router(resources.router)
+app.include_router(admin.router)
 
 
-def execute_tool(name: str, args: dict) -> str:
-    if name == "web_search":
-        return web_search(args.get("query", ""), args.get("max_results", 5))
-    return f"Unknown tool: {name}"
+@app.on_event("startup")
+def create_tables():
+    Base.metadata.create_all(bind=engine)
+
+
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
