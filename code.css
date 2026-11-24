@@ -1,0 +1,177 @@
+:root {
+  --bg: #101417;
+  --panel: #1a2025;
+  --text: #e8ecef;
+  --muted: #8a959e;
+  --accent: #4fd1a5;
+  --accent-dark: #2c8a6c;
+  --crisis: #d15c5c;
+  --me: #2b3a44;
+  --bot: #1e262c;
+  font-size: 16px;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.7rem 1rem;
+  padding-top: calc(0.7rem + env(safe-area-inset-top));
+  background: var(--panel);
+  border-bottom: 1px solid #262e34;
+}
+
+.brand { font-weight: 700; font-size: 1.05rem; display: flex; align-items: center; gap: 0.45rem; }
+.dot { width: 0.6rem; height: 0.6rem; border-radius: 50%; background: var(--accent); display: inline-block; }
+
+.auth-chip { display: flex; align-items: center; gap: 0.5rem; }
+.pill {
+  font-size: 0.72rem;
+  color: var(--muted);
+  border: 1px solid #333d44;
+  border-radius: 999px;
+  padding: 0.2rem 0.6rem;
+  max-width: 10rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pill.known { color: var(--accent); border-color: var(--accent-dark); }
+
+.btn {
+  font: inherit;
+  padding: 0.45rem 0.9rem;
+  border-radius: 0.5rem;
+  border: 1px solid #3a454d;
+  background: var(--bot);
+  color: var(--text);
+  cursor: pointer;
+}
+.btn.primary { background: var(--accent-dark); border-color: var(--accent-dark); }
+.btn.ghost { background: transparent; border-color: transparent; color: var(--accent); }
+
+.chat {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  max-width: 46rem;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.msg {
+  max-width: 85%;
+  padding: 0.65rem 0.85rem;
+  border-radius: 1rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+.msg.bot { background: var(--bot); align-self: flex-start; border-bottom-left-radius: 0.25rem; }
+.msg.me { background: var(--me); align-self: flex-end; border-bottom-right-radius: 0.25rem; }
+.msg.crisis { border-left: 4px solid var(--crisis); }
+.msg.typing { color: var(--muted); font-style: italic; }
+.msg img { max-width: 100%; border-radius: 0.5rem; margin-top: 0.4rem; }
+
+.composer {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-end;
+  padding: 0.7rem;
+  padding-bottom: calc(0.7rem + env(safe-area-inset-bottom));
+  background: var(--panel);
+  border-top: 1px solid #262e34;
+}
+
+.composer textarea {
+  flex: 1;
+  resize: none;
+  font: inherit;
+  background: var(--bot);
+  color: var(--text);
+  border: 1px solid #333d44;
+  border-radius: 0.8rem;
+  padding: 0.6rem 0.8rem;
+  max-height: 30dvh;
+  outline: none;
+}
+
+.send {
+  font: inherit;
+  font-weight: 600;
+  background: var(--accent);
+  color: #0b1310;
+  border: none;
+  border-radius: 0.8rem;
+  padding: 0.6rem 1rem;
+  cursor: pointer;
+}
+.send:disabled { opacity: 0.5; }
+
+.iconbtn {
+  font: inherit;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 1.2rem;
+  cursor: pointer;
+  padding: 0.4rem;
+}
+.iconbtn.has-image { color: var(--accent); }
+
+.modal {
+  margin: auto;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid #333d44;
+  border-radius: 1rem;
+  padding: 1.2rem;
+  width: min(92vw, 24rem);
+}
+.modal::backdrop { background: rgba(0, 0, 0, 0.6); }
+
+.modal-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
+.tabs { display: flex; gap: 0.3rem; }
+.tab {
+  font: inherit;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  padding: 0.35rem 0.55rem;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.tabpane input {
+  display: block;
+  width: 100%;
+  font: inherit;
+  background: var(--bot);
+  color: var(--text);
+  border: 1px solid #333d44;
+  border-radius: 0.5rem;
+  padding: 0.6rem 0.75rem;
+  margin-bottom: 0.6rem;
+  outline: none;
+}
+.tabpane .btn { width: 100%; }
+
+.hint { color: var(--muted); font-size: 0.85rem; line-height: 1.4; }
+.err { color: var(--crisis); font-size: 0.85rem; min-height: 1rem; }
+.hidden { display: none; }
