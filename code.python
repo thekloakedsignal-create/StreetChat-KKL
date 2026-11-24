@@ -1,33 +1,143 @@
-"""Public resource directory + debug context endpoint. Everything here
-is verified-only by construction — candidates live in the admin router.
+"""Twilio SMS webhook. Handles:
+  - LINK/JOIN/UNLINK/LOGOUT commands (account <-> phone mapping)
+  - MMS image passthrough to the vision pipeline
+  - Everything else -> orchestrator, with 429 token-bucket per phone
+
+Security: X-Twilio-Signature is ALWAYS validated (fail closed).
 """
-from fastapi import APIRouter, Depends, Query
+import logging
+import re
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy.orm import Session
+from twilio.twiml.messaging_response import MessagingResponse
 
+from app.clients.twilio_client import fetch_media_base64, validate_signature
 from app.database import get_db
-from app.models.resource import Resource
-from app.schemas import ResourceOut
-from app.services.retrieval import get_rag_context
+from app.deps import hash_password, verify_password
+from app.models.user import User, UserChannel
+from app.services.chat_orchestrator import process_message
 
-router = APIRouter(prefix="/api/resources", tags=["resources"])
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/sms", tags=["sms"])
 
+JOIN_RE = re.compile(r"^(?:JOIN|LINK)\s+(\S+)\s+(\S+)$", re.IGNORECASE)
+UNLINK_RE = re.compile(r"^(?:UNLINK|LOGOUT)$", re.IGNORECASE)
 
-@router.get("", response_model=list[ResourceOut])
-def list_resources(
-    city: str | None = Query(None),
-    service_type: str | None = Query(None),
-    db: Session = Depends(get_db),
-):
-    q = db.query(Resource).filter(Resource.verified.is_(True))
-    if city:
-        q = q.filter(Resource.city.ilike(f"%{city}%"))
-    if service_type:
-        # service_types is JSON array; contains() works on Postgres JSON
-        q = q.filter(Resource.service_types.contains([service_type.lower()]))
-    return q.order_by(Resource.city, Resource.name).limit(200).all()
+# Per-phone rate limit: 20 messages / 5 minutes
+_tokens: dict[str, tuple[int, datetime]] = {}
+_BUCKET_MAX = 20
+_BUCKET_WINDOW = timedelta(minutes=5)
 
 
-@router.get("/context")
-def rag_context(query: str = Query(...), db: Session = Depends(get_db)):
-    """Debug: see exactly what RAG would inject for a given message."""
-    return {"query": query, "context": get_rag_context(db, query)}
+def _allow(phone: str) -> bool:
+    now = datetime.now(timezone.utc)
+    count, reset_at = _tokens.get(phone, (0, now + _BUCKET_WINDOW))
+    if now >= reset_at:
+        count, reset_at = 0, now + _BUCKET_WINDOW
+    count += 1
+    _tokens[phone] = (count, reset_at)
+    return count <= _BUCKET_MAX
+
+
+def _twiml(text: str) -> Response:
+    resp = MessagingResponse()
+    # Twilio hard limit is 1600 chars per message; leave headroom
+    resp.message(text[:1500])
+    return Response(content=str(resp), media_type="application/xml")
+
+
+@router.post("/incoming")
+async def incoming(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    params = {k: v for k, v in form.items()}
+    signature = request.headers.get("X-Twilio-Signature", "")
+
+    if not validate_signature(str(request.url), params, signature):
+        logger.warning("rejected sms webhook with invalid signature")
+        return Response(status_code=403)
+
+    from_number = params.get("From", "").strip()
+    body = (params.get("Body") or "").strip()
+    num_media = int(params.get("NumMedia", "0"))
+
+    if not from_number:
+        return _twiml("Couldn't read your number. Text 211 for help.")
+
+    if not _allow(from_number):
+        return _twiml("That's a lot at once — give me a minute and text again.")
+
+    # --- account commands ---
+    if UNLINK_RE.match(body):
+        return _handle_unlink(db, from_number)
+
+    m = JOIN_RE.match(body)
+    if m:
+        return _handle_join(db, from_number, m.group(1), m.group(2))
+
+    # --- MMS attachments -> vision pipeline ---
+    images = None
+    if num_media > 0:
+        media_url = params.get("MediaUrl0")
+        media_type = params.get("MediaContentType0", "image/jpeg")
+        if media_url:
+            b64 = fetch_media_base64(media_url)
+            if b64:
+                images = [{"data": b64, "media_type": media_type}]
+        if not images:
+            return _twiml("I couldn't grab that image. Try sending it again?")
+        if not body:
+            body = "What's in this image?"
+
+    if not body:
+        return _twiml("Send me a message and I'll do my best to help. Text 211 for OC services.")
+
+    result = await process_message(
+        db=db,
+        message=body,
+        channel="sms",
+        channel_identifier=from_number,
+        user=None,
+        phone=from_number,
+        images=images,
+    )
+    reply = result["reply"]
+    if not result["identified"]:
+        reply += "\n\nWant me to remember you? Reply: JOIN <username> <password>"
+    return _twiml(reply)
+
+
+def _handle_join(db: Session, phone: str, username: str, password: str):
+    uname = username.strip().lower()
+    user = db.query(User).filter(User.username == uname).first()
+    if not user:
+        return _twiml(f"No account named '{username}' yet. Make one at the web chat first, then LINK here.")
+    if not verify_password(password, user.password_hash):
+        return _twiml("That password doesn't match. Try again, or text UNLINK to detach this phone.")
+
+    existing = db.query(UserChannel).filter(
+        UserChannel.channel == "sms",
+        UserChannel.identifier == phone,
+        UserChannel.active.is_(True),
+    ).first()
+    if existing:
+        existing.active = False
+        db.commit()
+
+    db.add(UserChannel(user_id=user.id, channel="sms", identifier=phone, active=True))
+    db.commit()
+    logger.info(f"sms linked: user id={user.id}")
+    return _twiml(f"You're linked, {user.username}. I'll remember you from here on. What's going on?")
+
+
+def _handle_unlink(db: Session, phone: str):
+    links = db.query(UserChannel).filter(
+        UserChannel.channel == "sms",
+        UserChannel.identifier == phone,
+        UserChannel.active.is_(True),
+    ).all()
+    for link in links:
+        link.active = False
+    db.commit()
+    return _twiml("This phone is unlinked. Your account stays — log in from the web chat anytime.")
