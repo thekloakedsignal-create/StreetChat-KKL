@@ -1,110 +1,155 @@
-"""Hybrid RAG over verified resources: pgvector dense + Postgres FTS,
-fused with Reciprocal Rank Fusion. Only verified=True rows are ever
-visible here — candidates live in a different table entirely.
+"""The chat pipeline. Every message — web or SMS — flows through here.
+
+Order of operations:
+  1. Deterministic risk score (never trust the model with crisis)
+  2. Resolve user (linked account or anonymous)
+  3. Load journal memory block
+  4. RAG retrieval over verified resources
+  5. Assemble system prompt (persona + memory + RAG + suffixes)
+  6. Load recent conversation window
+  7. Call Featherless (with tool loop)
+  8. Persist conversation turns
+  9. Post-response journal summary (per user's design: update AFTER reply)
 """
 import logging
-from functools import lru_cache
-from typing import Optional
+from datetime import datetime, timezone
 
-from sqlalchemy import cast, func, or_, String
 from sqlalchemy.orm import Session
 
-from app.config import settings
+from app.models.conversation import Conversation
+from app.models.journal import JournalEntry
 from app.models.resource import Resource
+from app.models.user import User, UserChannel
+from app.prompt_loader import (
+    casemanager_system_prompt,
+    client_system_prompt,
+    crisis_suffix,
+    sms_suffix,
+)
+from app.clients.featherless import chat as llm_chat, FeatherlessError
+from app.services.risk_scoring import score_risk
+from app.services.journal_service import get_memory_block, add_session_entry
+from app.services.retrieval import get_rag_context
 
 logger = logging.getLogger(__name__)
 
-TOP_K = 6
-RRF_K = 60
-
-_embedder = None
+HISTORY_WINDOW = 10  # messages each way
 
 
-def _get_embedder():
-    global _embedder
-    if _embedder is None and settings.embeddings_enabled:
-        from fastembed import TextEmbedding
-        _embedder = TextEmbedding("BAAI/bge-small-en-v1.5")
-    return _embedder
-
-
-def embed_text(text: str) -> Optional[list[float]]:
-    emb = _get_embedder()
-    if emb is None:
-        return None
-    try:
-        return list(emb.embed([text]))[0].tolist()
-    except Exception as e:
-        logger.warning(f"embed failed: {e}")
-        return None
-
-
-def hybrid_search(db: Session, query: str, top_k: int = TOP_K) -> list[Resource]:
-    base = db.query(Resource).filter(Resource.verified.is_(True))
-
-    # Dense side (may be empty if embeddings disabled)
-    dense: list[Resource] = []
-    vec = embed_text(query)
-    if vec is not None:
-        dense = (
-            base.filter(Resource.embedding.isnot(None))
-            .order_by(Resource.embedding.cosine_distance(vec))
-            .limit(top_k * 2)
-            .all()
+def _resolve_user_by_phone(db: Session, phone: str):
+    uc = (
+        db.query(UserChannel)
+        .filter(
+            UserChannel.channel == "sms",
+            UserChannel.identifier == phone,
+            UserChannel.active.is_(True),
         )
-
-    # Keyword side: trigram-ish ILIKE over name/description/service types
-    words = [w for w in query.lower().split() if len(w) > 3][:6]
-    if not words:
-        words = [query.lower()]
-    conds = []
-    for w in words:
-        like = f"%{w}%"
-        conds.append(Resource.name.ilike(like))
-        conds.append(Resource.description.ilike(like))
-        conds.append(Resource.city.ilike(like))
-        conds.append(cast(Resource.service_types, String).ilike(like))
-    keyword = base.filter(or_(*conds)).limit(top_k * 2).all()
-
-    # RRF fuse
-    scores: dict[int, float] = {}
-    by_id: dict[int, Resource] = {}
-    for rank, r in enumerate(dense):
-        scores[r.id] = scores.get(r.id, 0.0) + 1.0 / (RRF_K + rank + 1)
-        by_id[r.id] = r
-    for rank, r in enumerate(keyword):
-        scores[r.id] = scores.get(r.id, 0.0) + 1.0 / (RRF_K + rank + 1)
-        by_id[r.id] = r
-
-    ranked_ids = sorted(scores, key=scores.get, reverse=True)[:top_k]
-    return [by_id[i] for i in ranked_ids]
+        .first()
+    )
+    if not uc:
+        return None
+    return db.query(User).filter(User.id == uc.user_id).first()
 
 
-def format_context(resources: list[Resource]) -> str:
-    if not resources:
-        return ""
-    lines = ["VERIFIED LOCAL RESOURCES (cite these by name, phone, and URL):"]
-    for r in resources:
-        line = f"• {r.name}"
-        if r.city:
-            line += f" ({r.city})"
-        if r.phone:
-            line += f" — {r.phone}"
-        if r.hours:
-            line += f" — {r.hours}"
-        lines.append(line)
-        if r.address:
-            lines.append(f"  Address: {r.address}")
-        if r.eligibility:
-            lines.append(f"  Eligibility: {r.eligibility[:200]}")
-        if r.url:
-            lines.append(f"  {r.url}")
-    return "\n".join(lines)
+def _load_history(db: Session, user_id, channel: str, identifier: str) -> list[dict]:
+    q = db.query(Conversation).filter(
+        Conversation.channel == channel,
+        Conversation.channel_identifier == identifier,
+    )
+    if user_id is not None:
+        q = q.filter(Conversation.user_id == user_id)
+    rows = q.order_by(Conversation.created_at.desc()).limit(HISTORY_WINDOW).all()
+    return [{"role": r.role, "content": r.content} for r in reversed(rows)]
 
 
-def get_rag_context(db: Session, query: str, top_k: int = TOP_K) -> str:
+def _persist_turn(db: Session, user_id, channel: str, identifier: str,
+                  role: str, content: str):
+    db.add(Conversation(
+        user_id=user_id, channel=channel,
+        channel_identifier=identifier, role=role, content=content[:4000],
+    ))
+    db.commit()
+
+
+def _summarize_for_journal(messages: list[dict], reply: str) -> str:
+    """Cheap deterministic session summary — topics + any resources named.
+    Intentionally not an LLM call; keeps the chat path fast and private."""
+    user_text = " ".join(m["content"] for m in messages if m["role"] == "user")
+    words = [w for w in user_text.split() if len(w) > 4][:40]
+    topics = ", ".join(sorted(set(w.lower().strip(".,!?")) for w in words)[:12])
+    return f"Topics: {topics}. Bot suggested: {reply[:250]}"
+
+
+async def process_message(
+    db: Session,
+    message: str,
+    channel: str,                # "web" | "sms"
+    channel_identifier: str,     # phone number or session/anon key
+    user: User | None = None,    # authed web user, if any
+    phone: str | None = None,    # for SMS user resolution
+    images: list[dict] | None = None,
+) -> dict:
+    risk = score_risk(message)
+
+    # Resolve account for SMS from phone number
+    if user is None and phone:
+        user = _resolve_user_by_phone(db, phone)
+
+    user_id = user.id if user else None
+    role = user.role if user else "client"
+
+    # Memory + RAG (only when we know who this is)
+    memory = get_memory_block(db, user_id, role) if user_id else ""
+    rag = get_rag_context(db, message)
+
+    # Persona
+    system_parts = [
+        casemanager_system_prompt() if role == "case_manager" else client_system_prompt()
+    ]
+    if memory:
+        system_parts.append(memory)
+    if rag:
+        system_parts.append(rag)
+    if risk["crisis_triggered"]:
+        system_parts.append(crisis_suffix())
+    if channel == "sms":
+        system_parts.append(sms_suffix())
+
+    messages = [{"role": "system", "content": "\n\n".join(system_parts)}]
+    if user_id:
+        messages.extend(_load_history(db, user_id, channel, channel_identifier))
+    messages.append({"role": "user", "content": message})
+
     try:
-        return format_context(hybrid_search(db, query, top_k))
+        reply = llm_chat(messages, use_tools=True, images=images)
+    except FeatherlessError as e:
+        logger.error(f"LLM call failed: {e}")
+        reply = ("I'm having trouble connecting right now. If this is urgent, "
+                 "call or text 988, or dial 2-1-1 for Orange County services.")
+
+    if risk["crisis_triggered"] and risk.get("hotline") and risk["hotline"] not in reply:
+        reply = f"{risk['hotline']}\n\n{reply}"
+
+    # Persist both turns
+    try:
+        _persist_turn(db, user_id, channel, channel_identifier, "user", message)
+        _persist_turn(db, user_id, channel, channel_identifier, "assistant", reply)
     except Exception as e:
-        logger.warning(f"RAG retrieval failed: {e}")
-        return ""
+        logger.warning(f"conversation persist failed: {e}")
+        db.rollback()
+
+    # Journal AFTER the reply (by design)
+    if user_id:
+        try:
+            summary = _summarize_for_journal(messages, reply)
+            add_session_entry(db, user_id, role, summary, channel)
+        except Exception as e:
+            logger.warning(f"journal update failed: {e}")
+            db.rollback()
+
+    return {
+        "reply": reply,
+        "crisis": risk["crisis_triggered"],
+        "risk_score": risk["score"],
+        "identified": user_id is not None,
+    }
