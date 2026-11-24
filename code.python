@@ -1,82 +1,33 @@
-"""Admin: candidate review queue + growth agent trigger.
-Guarded by a static API key header (X-Admin-Key), separate from user JWTs.
+"""Public resource directory + debug context endpoint. Everything here
+is verified-only by construction — candidates live in the admin router.
 """
-import logging
-from datetime import datetime, timezone
-
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
-from app.config import settings
 from app.database import get_db
-from app.models.candidate import ResourceCandidate
 from app.models.resource import Resource
-from app.schemas import CandidateOut, ReviewRequest
-from app.services.growth_agent import run_growth_agent
+from app.schemas import ResourceOut
+from app.services.retrieval import get_rag_context
 
-logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/admin", tags=["admin"])
-
-
-def require_admin(x_admin_key: str = Header(default="")):
-    if not settings.admin_api_key or x_admin_key != settings.admin_api_key:
-        raise HTTPException(401, "Invalid admin key")
+router = APIRouter(prefix="/api/resources", tags=["resources"])
 
 
-@router.get("/candidates", response_model=list[CandidateOut], dependencies=[Depends(require_admin)])
-def list_candidates(status: str = "pending", db: Session = Depends(get_db)):
-    return (
-        db.query(ResourceCandidate)
-        .filter(ResourceCandidate.status == status)
-        .order_by(ResourceCandidate.found_at.desc())
-        .limit(200)
-        .all()
-    )
+@router.get("", response_model=list[ResourceOut])
+def list_resources(
+    city: str | None = Query(None),
+    service_type: str | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    q = db.query(Resource).filter(Resource.verified.is_(True))
+    if city:
+        q = q.filter(Resource.city.ilike(f"%{city}%"))
+    if service_type:
+        # service_types is JSON array; contains() works on Postgres JSON
+        q = q.filter(Resource.service_types.contains([service_type.lower()]))
+    return q.order_by(Resource.city, Resource.name).limit(200).all()
 
 
-@router.post("/candidates/{cid}/approve", response_model=CandidateOut, dependencies=[Depends(require_admin)])
-def approve(cid: int, req: ReviewRequest, db: Session = Depends(get_db)):
-    c = db.query(ResourceCandidate).filter(ResourceCandidate.id == cid).first()
-    if not c:
-        raise HTTPException(404, "not found")
-    c.status = "approved"
-    c.reviewer_notes = req.notes
-    c.reviewed_at = datetime.now(timezone.utc)
-
-    # Promote to verified Resource
-    resource = Resource(
-        name=c.name,
-        description=c.description,
-        address=c.address,
-        city=c.city,
-        phone=c.phone,
-        url=c.url,
-        hours=c.hours,
-        eligibility=c.eligibility,
-        service_types=[t.strip().lower() for t in (c.service_types or "").split(",") if t.strip()],
-        source_url=c.source_url,
-        verified=True,
-    )
-    db.add(resource)
-    db.commit()
-    db.refresh(c)
-    logger.info(f"candidate {cid} approved -> resource {resource.id}")
-    return c
-
-
-@router.post("/candidates/{cid}/reject", response_model=CandidateOut, dependencies=[Depends(require_admin)])
-def reject(cid: int, req: ReviewRequest, db: Session = Depends(get_db)):
-    c = db.query(ResourceCandidate).filter(ResourceCandidate.id == cid).first()
-    if not c:
-        raise HTTPException(404, "not found")
-    c.status = "rejected"
-    c.reviewer_notes = req.notes
-    c.reviewed_at = datetime.now(timezone.utc)
-    db.commit()
-    db.refresh(c)
-    return c
-
-
-@router.post("/growth/run", dependencies=[Depends(require_admin)])
-def run_growth(db: Session = Depends(get_db)):
-    return run_growth_agent(db)
+@router.get("/context")
+def rag_context(query: str = Query(...), db: Session = Depends(get_db)):
+    """Debug: see exactly what RAG would inject for a given message."""
+    return {"query": query, "context": get_rag_context(db, query)}
