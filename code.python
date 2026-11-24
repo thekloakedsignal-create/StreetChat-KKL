@@ -1,115 +1,36 @@
-"""OpenAI-compatible client for Featherless, with tool-call loop.
-
-The orchestrator builds the message list; this module owns the
-"call model -> maybe run tools -> call again" dance, capped so a
-tool-happy model can't loop forever.
-"""
+"""Inbound MMS media needs HTTP Basic auth with account creds."""
+import base64
 import logging
-from typing import Optional
 
 import httpx
 
 from app.config import settings
-from app.clients.tools import TOOL_SCHEMAS, execute_tool
 
 logger = logging.getLogger(__name__)
 
-MAX_TOOL_ROUNDS = 3
-MAX_TOKENS = 1000
 
-
-class FeatherlessError(Exception):
-    pass
-
-
-def chat(
-    messages: list[dict],
-    use_tools: bool = True,
-    temperature: float = 0.6,
-    images: Optional[list[dict]] = None,
-) -> str:
-    """Non-streaming chat completion with tool loop.
-
-    `messages` is OpenAI-format: [{"role": "system"|"user"|"assistant", "content": "..."}]
-    `images` is a list of {"data": <base64>, "media_type": "image/jpeg"} — appended
-    to the last user message as vision content blocks.
-    """
-    if images:
-        messages = _attach_images(messages, images)
-
-    payload_messages = list(messages)
-
-    for _ in range(MAX_TOOL_ROUNDS if use_tools else 1):
-        body = {
-            "model": settings.model_name,
-            "messages": payload_messages,
-            "temperature": temperature,
-            "max_tokens": MAX_TOKENS,
-        }
-        if use_tools:
-            body["tools"] = TOOL_SCHEMAS
-            body["tool_choice"] = "auto"
-
-        data = _post("/chat/completions", body)
-        choice = data["choices"][0]
-        message = choice["message"]
-
-        tool_calls = message.get("tool_calls")
-        if not tool_calls:
-            return (message.get("content") or "").strip()
-
-        # Model asked for tools — execute and feed results back
-        payload_messages.append(message)
-        for call in tool_calls:
-            name = call["function"]["name"]
-            try:
-                import json
-                args = json.loads(call["function"].get("arguments") or "{}")
-            except ValueError:
-                args = {}
-            logger.info(f"tool call: {name}({args})")
-            result = execute_tool(name, args)
-            payload_messages.append({
-                "role": "tool",
-                "tool_call_id": call["id"],
-                "content": str(result)[:4000],
-            })
-
-    # Hit the round cap with tools still pending — take whatever text we have
-    logger.warning("tool loop hit MAX_TOOL_ROUNDS")
-    return (payload_messages[-1].get("content") or "").strip()
-
-
-def _post(path: str, body: dict) -> dict:
-    if not settings.featherless_api_key:
-        raise FeatherlessError("FEATHERLESS_API_KEY is not set")
+def fetch_media_base64(media_url: str) -> str | None:
+    """Download a Twilio media attachment and return base64 content."""
+    if not settings.twilio_account_sid or not settings.twilio_auth_token:
+        logger.warning("Twilio creds unset — cannot fetch media")
+        return None
     try:
-        resp = httpx.post(
-            f"{settings.featherless_base_url}{path}",
-            headers={"Authorization": f"Bearer {settings.featherless_api_key}"},
-            json=body,
-            timeout=60.0,
+        resp = httpx.get(
+            media_url,
+            auth=(settings.twilio_account_sid, settings.twilio_auth_token),
+            timeout=30.0,
+            follow_redirects=True,
         )
         resp.raise_for_status()
-        return resp.json()
-    except httpx.HTTPStatusError as e:
-        logger.error(f"Featherless HTTP {e.response.status_code}: {e.response.text[:300]}")
-        raise FeatherlessError(f"Model API returned {e.response.status_code}") from e
-    except httpx.RequestError as e:
-        logger.error(f"Featherless request failed: {e}")
-        raise FeatherlessError("Model API unreachable") from e
+        return base64.b64encode(resp.content).decode()
+    except Exception as e:
+        logger.warning(f"media fetch failed: {e}")
+        return None
 
 
-def _attach_images(messages: list[dict], images: list[dict]) -> list[dict]:
-    messages = list(messages)
-    for i in range(len(messages) - 1, -1, -1):
-        if messages[i]["role"] == "user":
-            content = [{"type": "text", "text": messages[i]["content"]}]
-            for img in images:
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{img['media_type']};base64,{img['data']}"},
-                })
-            messages[i] = {"role": "user", "content": content}
-            break
-    return messages
+def validate_signature(url: str, params: dict, signature: str) -> bool:
+    """Verify X-Twilio-Signature. Always False if token unset (fail closed)."""
+    if not settings.twilio_auth_token:
+        return False
+    from twilio.request_validator import RequestValidator
+    return RequestValidator(settings.twilio_auth_token).validate(url, params, signature)
