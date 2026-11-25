@@ -1,122 +1,62 @@
-"""Smoke tests with the LLM mocked out. Run: python -m pytest tests/ -v"""
-import os
-import sys
-from unittest.mock import patch
+"""Deterministic risk detector. It *flags* risk, it does not *respond to*
+risk. Response framing is owned by the LLM (fine-tuned for it). This exists
+so the API/UI get a consistent non-LLM signal for rendering and logging —
+not so the backend can narrate at the user.
+"""
+import re
 
-os.environ.setdefault("DATABASE_URL", "sqlite:///./test.db")
-os.environ.setdefault("JWT_SECRET", "test-secret")
-os.environ.setdefault("EMBEDDINGS_ENABLED", "false")
+from app.config import settings
 
-from fastapi.testclient import TestClient  # noqa: E402
-from app.main import app  # noqa: E402
-from app.database import Base, engine  # noqa: E402
+# suicide/self-harm: unambiguous crisis
+_CRISIS_PATTERNS = [
+    r"\bk(?:ill|illing)\s+(?:myself|me)\b", r"\bsuicid",
+    r"\bend (?:it|my life|myself)\b", r"\bwanna die\b", r"\bwant to die\b",
+    r"\bno way out\b", r"\bend it all\b", r"\b(?:hurt|harm|cut)\s+myself\b",
+    r"\boverdose\b", r"\bno reason to (?:live|go on)\b", r"\bbetter off dead\b",
+    r"\bkill (?:me|myself)\b", r"\btake my (?:own )?life\b",
+]
+# partner violence: flagged for the API/UI — not auto-escalated, not lectured
+_DV_PATTERNS = [
+    r"\b(?:boyfriend|girlfriend|husband|wife|partner)\b[^.]{0,50}\b(?:hits?|beats?|chokes?|hurts?|rapes?|threw)\b",
+    r"\b(?:hits?|beats?|chokes?|hurts?|rapes?|threw)\b[^.]{0,50}\b(?:boyfriend|girlfriend|husband|wife|partner)\b",
+    r"\bdomestic violen", r"\babusive (?:boyfriend|girlfriend|partner|husband|wife)\b",
+]
 
-client = TestClient(app)
-Base.metadata.create_all(bind=engine)
-
-MOCK_LLM = "I hear you. Here is what I found."
-
-
-def _reg(uname, password="pass1"):
-    return client.post("/api/auth/register", json={
-        "username": uname, "password": password,
-        "recovery_question": "Street I grew up on?",
-        "recovery_answer": "Main Street",
-    })
-
-
-def test_health():
-    assert client.get("/api/health").status_code == 200
-
-
-def test_register_login_recovery():
-    r = _reg("alice")
-    assert r.status_code == 200 and r.json()["access_token"]
-
-    # dup username rejected
-    assert _reg("alice").status_code == 400
-
-    # bad password
-    assert client.post("/api/auth/login", json={"username": "alice", "password": "wrong"}).status_code == 401
-
-    # login
-    r = client.post("/api/auth/login", json={"username": "alice", "password": "pass1"})
-    assert r.status_code == 200
-
-    # recovery: get question, wrong answer fails, right answer resets
-    r = client.post("/api/auth/recover/start", json={"username": "alice"})
-    assert "grew up on" in r.json()["question"]
-    assert client.post("/api/auth/recover/finish", json={
-        "username": "alice", "answer": "nope", "new_password": "new1"}).status_code in (400, 401)
-    r = client.post("/api/auth/recover/finish", json={
-        "username": "alice", "answer": "  MAIN street ", "new_password": "new1"})
-    assert r.status_code == 200
-    # normalization worked — answer match is case/space-insensitive
-    assert client.post("/api/auth/login", json={"username": "alice", "password": "new1"}).status_code == 200
+CRISIS_HOTLINES = [
+    "988 — Suicide & Crisis Lifeline, call or text, 24/7",
+    "Crisis Text Line — text HOME to 741741",
+]
 
 
-def test_chat_anonymous_no_journals():
-    with patch("app.clients.featherless.chat", return_value=MOCK_LLM):
-        r = client.post("/api/chat", json={"message": "I need a shelter tonight"})
-    assert r.status_code == 200
-    assert r.json()["reply"] == MOCK_LLM
-    assert r.json()["identified"] is False
+def _matches_any(text: str, patterns: list[str]) -> list[str]:
+    return [p for p in patterns if re.search(p, text, re.IGNORECASE)]
 
 
-def test_chat_authenticated_journals():
-    tok = _reg("bob").json()["access_token"]
-    h = {"Authorization": f"Bearer {tok}"}
-    with patch("app.clients.featherless.chat", return_value=MOCK_LLM):
-        r = client.post("/api/chat", json={"message": "keeping my dog tonight"}, headers=h)
-        assert r.json()["identified"] is True
+def score_risk(message: str) -> dict:
+    crisis_hits = _matches_any(message, _CRISIS_PATTERNS)
+    dv_hits = _matches_any(message, _DV_PATTERNS)
 
-    # journal entry was written
-    from app.database import get_db_ctx
-    from app.models.journal import JournalEntry
-    with get_db_ctx() as db:
-        assert db.query(JournalEntry).filter(JournalEntry.role_scope == "client").count() >= 1
+    score = 0.0
+    if crisis_hits:
+        score += 70 + 15 * len(crisis_hits)
+    if dv_hits:
+        score += 30 + 5 * len(dv_hits)
 
+    crisis_triggered = score >= settings.risk_threshold
+    dv_flagged = bool(dv_hits)
 
-def test_role_scoping_isolation():
-    """Two accounts, separate journals — even when one is case_manager."""
-    tok_a = _reg("mgr_user").json()["access_token"]
-    tok_b = _reg("other_user").json()["access_token"]
-    with patch("app.clients.featherless.chat", return_value=MOCK_LLM):
-        client.post("/api/chat", json={"message": "manager context"}, headers={"Authorization": f"Bearer {tok_a}"})
-        client.post("/api/chat", json={"message": "client context"}, headers={"Authorization": f"Bearer {tok_b}"})
-    from app.database import get_db_ctx
-    from app.models.journal import JournalEntry
-    from app.models.user import User
-    with get_db_ctx() as db:
-        uid_a = db.query(User).filter(User.username == "mgr_user").one().id
-        uid_b = db.query(User).filter(User.username == "other_user").one().id
-        journals_a = db.query(JournalEntry).filter(JournalEntry.user_id == uid_a).all()
-        assert all(j.user_id == uid_a for j in journals_a)
-        assert len(journals_a) >= 1
-        assert db.query(JournalEntry).filter(JournalEntry.user_id == uid_b).count() >= 1
+    tags = []
+    if crisis_triggered:
+        tags.append("crisis")
+    if dv_flagged:
+        tags.append("dv")
 
-
-def test_risk_scoring():
-    from app.services.risk_scoring import score_risk
-    assert score_risk("I want to kill myself")["crisis_triggered"] is True
-    assert score_risk("I want to kill myself")["hotline"] is not None
-    assert score_risk("looking for a shower")["crisis_triggered"] is False
-    assert score_risk("my boyfriend hits me")["crisis_triggered"] is True
-
-
-def test_resources_and_context_endpoints():
-    r = client.get("/api/resources")
-    assert r.status_code == 200
-    r = client.get("/api/resources/context", params={"query": "shelter tonight"})
-    assert r.status_code == 200
-    assert "context" in r.json()
-
-
-def test_admin_requires_key():
-    assert client.get("/admin/candidates").status_code in (401, 422)
-
-
-def test_sms_signature_required():
-    # unsigned webhook must be rejected (fail closed)
-    r = client.post("/sms/incoming", data={"From": "+15551234567", "Body": "hello"})
-    assert r.status_code == 403
+    return {
+        "score": min(score, 100),
+        "crisis_triggered": crisis_triggered,
+        "dv_flagged": dv_flagged,
+        "hotline": "; ".join(CRISIS_HOTLINES) if crisis_triggered else None,
+        "tags": tags,
+        "crisis_hits": crisis_hits,
+        "dv_hits": dv_hits,
+    }
