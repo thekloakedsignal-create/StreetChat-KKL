@@ -1,22 +1,36 @@
-Seeding with embeddings downloads the fastembed model on first run (~100MB).
+## SMS setup (Twilio)
 
-## Environment
+1. Buy a Twilio phone number.
+2. In the Twilio console → Phone Number → "A message comes in": HTTP POST to
+   `https://<your-domain>/sms/incoming`.
+3. Set `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` in env. If the token is
+   unset, **all inbound SMS is rejected** (fail closed — verified signature
+   is mandatory).
 
-See `.env.example`. Required to actually talk to a model:
+Text `JOIN <username> <password>` from your phone to link the number to your
+web account (so the bot remembers you on both channels). `UNLINK` detaches.
 
-| Var | Purpose |
+## Admin review queue
+
+Guarded by `X-Admin-Key: $ADMIN_API_KEY` header:
+
+- `GET /admin/candidates` — pending leads from the growth agent
+- `POST /admin/candidates/{id}/approve` — promotes the candidate into a verified
+  `Resource` (it becomes user-visible here, not before)
+- `POST /admin/candidates/{id}/reject`
+- `POST /admin/growth/run` — kick the growth agent manually
+
+## API surface
+
+| Endpoint | Purpose |
 |---|---|
-| `FEATHERLESS_API_KEY` | OpenAI-compatible endpoint key |
-| `MODEL_NAME` | Your fine-tuned model ID |
+| `POST /api/auth/register` | Create account (returns JWT) |
+| `POST /api/auth/login` | Frontend-argoru JWT |
+| `POST /api/auth/recover/start` \| `/finish` | Question-based password reset |
+| `POST /api/chat` | Web chat (auth optional; anon = no memory) |
+| `POST /api/chat/image` | Web chat with a photo (JSON: `image_base64`, `media_type`) |
+| `GET /api/resources` | Verified directory (`?city=&service_type=`) |
+| `GET /api/resources/context?query=` | Debug: what RAG would inject |
+| `POST /sms/incoming` | Twilio webhook (signature-validated) |
 
-Recommended for production: `JWT_SECRET`, `ADMIN_API_KEY`, `DATABASE_URL`.
-Optional channels: `TAVILY_API_KEY` (growth agent), `TWILIO_*` (SMS webhook).
-
-## Deploy (Railway, from render.yaml)
-
-1. Push this repo to GitHub.
-2. On Railtracks: **New Project → Blueprint → point at this repo**. The
-   blueprint provisions the pgvector database and web service together.
-3. In the web service **Variables** tab, set `FEATHERLESS_API_KEY` and
-   `ADMIN_API_KEY` (and optional `TAVILY_API_KEY`).
-4. After first deploy, run once (Railway Shell or `railway run`):
+## Project layout
