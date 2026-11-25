@@ -1,103 +1,122 @@
-"""DB bootstrap: pgvector extension + tables, optional seed import.
+"""Smoke tests with the LLM mocked out. Run: python -m pytest tests/ -v"""
+import os
+import sys
+from unittest.mock import patch
 
-Usage:
-    python -m scripts.init_db                      # extension + tables only
-    python -m scripts.init_db --seed data/seed     # imports every *.json in the dir
-    python -m scripts.init_db --seed some_file.json  # or a single file
+os.environ.setdefault("DATABASE_URL", "sqlite:///./test.db")
+os.environ.setdefault("JWT_SECRET", "test-secret")
+os.environ.setdefault("EMBEDDINGS_ENABLED", "false")
 
-Embedding rows takes a few minutes the first time (fastembed downloads
-the model). Run without --seed first to verify connectivity.
-"""
-import argparse
-import json
-import logging
-from pathlib import Path
+from fastapi.testclient import TestClient  # noqa: E402
+from app.main import app  # noqa: E402
+from app.database import Base, engine  # noqa: E402
 
-from sqlalchemy import text
+client = TestClient(app)
+Base.metadata.create_all(bind=engine)
 
-from app.database import Base, engine, get_db_ctx
-from app.models.resource import Resource
-from app.services.retrieval import embed_text
-
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+MOCK_LLM = "I hear you. Here is what I found."
 
 
-def ensure_extension():
-    with engine.connect() as conn:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        conn.commit()
-    logger.info("pgvector extension ready")
+def _reg(uname, password="pass1"):
+    return client.post("/api/auth/register", json={
+        "username": uname, "password": password,
+        "recovery_question": "Street I grew up on?",
+        "recovery_answer": "Main Street",
+    })
 
 
-def ensure_tables():
-    Base.metadata.create_all(bind=engine)
-    logger.info("tables ready")
+def test_health():
+    assert client.get("/api/health").status_code == 200
 
 
-def seed_file(db, path: Path) -> tuple[int, int]:
-    """Returns (added, skipped)."""
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    rows = payload.get("resources") if isinstance(payload, dict) else payload
-    if not rows:
-        logger.warning(f"{path.name}: no resources in file")
-        return 0, 0
+def test_register_login_recovery():
+    r = _reg("alice")
+    assert r.status_code == 200 and r.json()["access_token"]
 
-    added = skipped = 0
-    for item in rows:
-        name = (item.get("name") or "").strip()
-        if not name or db.query(Resource).filter(Resource.name == name).first():
-            skipped += 1
-            continue
+    # dup username rejected
+    assert _reg("alice").status_code == 400
 
-        blob = " — ".join(filter(None, [
-            name,
-            item.get("description"),
-            item.get("city"),
-            ", ".join(item.get("service_types") or []),
-        ]))
-        db.add(Resource(
-            name=name,
-            description=item.get("description"),
-            address=item.get("address"),
-            city=item.get("city"),
-            phone=item.get("phone"),
-            url=item.get("url"),
-            hours=item.get("hours"),
-            eligibility=item.get("eligibility"),
-            service_types=item.get("service_types") or [],
-            source_url=item.get("source_url") or item.get("url"),
-            verified=True,
-            embedding=embed_text(blob),
-        ))
-        added += 1
-        if added % 10 == 0:
-            logger.info(f"  seeded {added}…")
-    return added, skipped
+    # bad password
+    assert client.post("/api/auth/login", json={"username": "alice", "password": "wrong"}).status_code == 401
+
+    # login
+    r = client.post("/api/auth/login", json={"username": "alice", "password": "pass1"})
+    assert r.status_code == 200
+
+    # recovery: get question, wrong answer fails, right answer resets
+    r = client.post("/api/auth/recover/start", json={"username": "alice"})
+    assert "grew up on" in r.json()["question"]
+    assert client.post("/api/auth/recover/finish", json={
+        "username": "alice", "answer": "nope", "new_password": "new1"}).status_code in (400, 401)
+    r = client.post("/api/auth/recover/finish", json={
+        "username": "alice", "answer": "  MAIN street ", "new_password": "new1"})
+    assert r.status_code == 200
+    # normalization worked — answer match is case/space-insensitive
+    assert client.post("/api/auth/login", json={"username": "alice", "password": "new1"}).status_code == 200
 
 
-def seed_from(path: Path):
-    files = sorted(path.glob("*.json")) if path.is_dir() else [path]
-    if not files:
-        logger.warning(f"no seed files at {path}")
-        return
-    added_total = skipped_total = 0
+def test_chat_anonymous_no_journals():
+    with patch("app.clients.featherless.chat", return_value=MOCK_LLM):
+        r = client.post("/api/chat", json={"message": "I need a shelter tonight"})
+    assert r.status_code == 200
+    assert r.json()["reply"] == MOCK_LLM
+    assert r.json()["identified"] is False
+
+
+def test_chat_authenticated_journals():
+    tok = _reg("bob").json()["access_token"]
+    h = {"Authorization": f"Bearer {tok}"}
+    with patch("app.clients.featherless.chat", return_value=MOCK_LLM):
+        r = client.post("/api/chat", json={"message": "keeping my dog tonight"}, headers=h)
+        assert r.json()["identified"] is True
+
+    # journal entry was written
+    from app.database import get_db_ctx
+    from app.models.journal import JournalEntry
     with get_db_ctx() as db:
-        for f in files:
-            logger.info(f"seeding from {f}")
-            added, skipped = seed_file(db, f)
-            added_total += added
-            skipped_total += skipped
-    logger.info(f"seed complete: +{added_total}, skipped {skipped_total}")
+        assert db.query(JournalEntry).filter(JournalEntry.role_scope == "client").count() >= 1
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--seed", type=Path, default=None,
-                        help="Seed file or directory of seed JSON files")
-    args = parser.parse_args()
+def test_role_scoping_isolation():
+    """Two accounts, separate journals — even when one is case_manager."""
+    tok_a = _reg("mgr_user").json()["access_token"]
+    tok_b = _reg("other_user").json()["access_token"]
+    with patch("app.clients.featherless.chat", return_value=MOCK_LLM):
+        client.post("/api/chat", json={"message": "manager context"}, headers={"Authorization": f"Bearer {tok_a}"})
+        client.post("/api/chat", json={"message": "client context"}, headers={"Authorization": f"Bearer {tok_b}"})
+    from app.database import get_db_ctx
+    from app.models.journal import JournalEntry
+    from app.models.user import User
+    with get_db_ctx() as db:
+        uid_a = db.query(User).filter(User.username == "mgr_user").one().id
+        uid_b = db.query(User).filter(User.username == "other_user").one().id
+        journals_a = db.query(JournalEntry).filter(JournalEntry.user_id == uid_a).all()
+        assert all(j.user_id == uid_a for j in journals_a)
+        assert len(journals_a) >= 1
+        assert db.query(JournalEntry).filter(JournalEntry.user_id == uid_b).count() >= 1
 
-    ensure_extension()
-    ensure_tables()
-    if args.seed:
-        seed_from(args.seed)
+
+def test_risk_scoring():
+    from app.services.risk_scoring import score_risk
+    assert score_risk("I want to kill myself")["crisis_triggered"] is True
+    assert score_risk("I want to kill myself")["hotline"] is not None
+    assert score_risk("looking for a shower")["crisis_triggered"] is False
+    assert score_risk("my boyfriend hits me")["crisis_triggered"] is True
+
+
+def test_resources_and_context_endpoints():
+    r = client.get("/api/resources")
+    assert r.status_code == 200
+    r = client.get("/api/resources/context", params={"query": "shelter tonight"})
+    assert r.status_code == 200
+    assert "context" in r.json()
+
+
+def test_admin_requires_key():
+    assert client.get("/admin/candidates").status_code in (401, 422)
+
+
+def test_sms_signature_required():
+    # unsigned webhook must be rejected (fail closed)
+    r = client.post("/sms/incoming", data={"From": "+15551234567", "Body": "hello"})
+    assert r.status_code == 403
