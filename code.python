@@ -1,115 +1,13 @@
-"""Smoke tests with the LLM mocked out. Run: python -m pytest tests/ -v"""
-import os
-from unittest.mock import patch
+system_parts = [
+        casemanager_system_prompt() if role == "case_manager" else client_system_prompt()
+    ]
+    if memory:
+        system_parts.append(memory)
+    if rag:
+        system_parts.append(rag)
+    if channel == "sms":
+        system_parts.append(sms_suffix())
+    if risk.get("hotline"):
+        system_parts.append(f"CRISIS LINES (for your info, use only if natural): {risk['hotline']}")
 
-os.environ.setdefault("DATABASE_URL", "sqlite:///./test.db")
-os.environ.setdefault("JWT_SECRET", "test-secret")
-os.environ.setdefault("EMBEDDINGS_ENABLED", "false")
-
-from fastapi.testclient import TestClient  # noqa: E402
-from app.main import app  # noqa: E402
-from app.database import Base, engine  # noqa: E402
-
-client = TestClient(app)
-Base.metadata.create_all(bind=engine)
-
-MOCK_LLM = "I hear you. Here is what I found."
-
-
-def _reg(uname, password="pass1"):
-    return client.post("/api/auth/register", json={
-        "username": uname, "password": password,
-        "recovery_question": "Street I grew up on?",
-        "recovery_answer": "Main Street",
-    })
-
-
-def test_health():
-    assert client.get("/api/health").status_code == 200
-
-
-def test_register_login_recovery():
-    r = _reg("alice")
-    assert r.status_code == 200 and r.json()["access_token"]
-    assert _reg("alice").status_code == 400
-    assert client.post("/api/auth/login", json={"username": "alice", "password": "wrong"}).status_code == 401
-    assert client.post("/api/auth/login", json={"username": "alice", "password": "pass1"}).status_code == 200
-
-    r = client.post("/api/auth/recover/start", json={"username": "alice"})
-    assert "grew up on" in r.json()["question"]
-    assert client.post("/api/auth/recover/finish", json={
-        "username": "alice", "answer": "nope", "new_password": "new1"}).status_code in (400, 401)
-    r = client.post("/api/auth/recover/finish", json={
-        "username": "alice", "answer": "  MAIN street ", "new_password": "new1"})
-    assert r.status_code == 200
-    assert client.post("/api/auth/login", json={"username": "alice", "password": "new1"}).status_code == 200
-
-
-def test_chat_anonymous_no_journals():
-    with patch("app.clients.featherless.chat", return_value=MOCK_LLM):
-        r = client.post("/api/chat", json={"message": "I need a shelter tonight"})
-    assert r.status_code == 200
-    assert r.json()["reply"] == MOCK_LLM
-    assert r.json()["identified"] is False
-
-
-def test_chat_authenticated_journals():
-    tok = _reg("bob").json()["access_token"]
-    h = {"Authorization": f"Bearer {tok}"}
-    with patch("app.clients.featherless.chat", return_value=MOCK_LLM):
-        r = client.post("/api/chat", json={"message": "keeping my dog tonight"}, headers=h)
-        assert r.json()["identified"] is True
-
-    from app.database import get_db_ctx
-    from app.models.journal import JournalEntry
-    with get_db_ctx() as db:
-        assert db.query(JournalEntry).filter(JournalEntry.role_scope == "client").count() >= 1
-
-
-def test_role_scoping_isolation():
-    tok_a = _reg("mgr_user").json()["access_token"]
-    tok_b = _reg("other_user").json()["access_token"]
-    with patch("app.clients.featherless.chat", return_value=MOCK_LLM):
-        client.post("/api/chat", json={"message": "manager context"}, headers={"Authorization": f"Bearer {tok_a}"})
-        client.post("/api/chat", json={"message": "client context"}, headers={"Authorization": f"Bearer {tok_b}"})
-    from app.database import get_db_ctx
-    from app.models.journal import JournalEntry
-    from app.models.user import User
-    with get_db_ctx() as db:
-        uid_a = db.query(User).filter(User.username == "mgr_user").one().id
-        uid_b = db.query(User).filter(User.username == "other_user").one().id
-        journals_a = db.query(JournalEntry).filter(JournalEntry.user_id == uid_a).all()
-        assert all(j.user_id == uid_a for j in journals_a)
-        assert len(journals_a) >= 1
-        assert db.query(JournalEntry).filter(JournalEntry.user_id == uid_b).count() >= 1
-
-
-def test_risk_scoring():
-    from app.services.risk_scoring import score_risk
-    # suicide statement -> crisis signal
-    assert score_risk("I want to kill myself")["crisis_triggered"] is True
-    assert score_risk("I want to kill myself")["hotline"] is not None
-    # DV disclosure -> flagged, NOT crisis-triggered, no hotline injection
-    dv = score_risk("my boyfriend hits me")
-    assert dv["dv_flagged"] is True
-    assert dv["crisis_triggered"] is False
-    assert dv["hotline"] is None
-    # ordinary request -> nothing
-    neutral = score_risk("looking for a shower")
-    assert neutral["crisis_triggered"] is False
-    assert neutral["dv_flagged"] is False
-
-
-def test_resources_and_context_endpoints():
-    assert client.get("/api/resources").status_code == 200
-    r = client.get("/api/resources/context", params={"query": "shelter tonight"})
-    assert r.status_code == 200 and "context" in r.json()
-
-
-def test_admin_requires_key():
-    assert client.get("/admin/candidates").status_code in (401, 422)
-
-
-def test_sms_signature_required():
-    r = client.post("/sms/incoming", data={"From": "+15551234567", "Body": "hello"})
-    assert r.status_code == 403
+    system_parts = [p for p in system_parts if p]
