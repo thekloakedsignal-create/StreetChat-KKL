@@ -1,11 +1,22 @@
-app/
-  main.py, config.py, database.py, deps.py, schemas.py, prompt_loader.py
-  models/{user,resource,journal,candidate,conversation}.py
-  routers/{chat,sms,auth,admin,resources}.py
-  services/{chat_orchestrator,journal_service,retrieval,growth_agent,risk_scoring}.py
-  clients/{featherless,twilio_client,tools}.py
-prompts/{client,casemanager}_system.md + suffixes
-scripts/{init_db,seed_resources}.py
-data/seed/oc_resources_seed.json   (housing-first + core services, 100 real entries)
-tests/test_journal_isolation.py, test_health.py
-Dockerfile, render.yaml, docker-compose.yml, requirements.txt, README.md
+Seeding with embeddings downloads the fastembed model on first run (~100MB).
+
+## Environment
+
+See `.env.example`. Required to actually talk to a model:
+
+| Var | Purpose |
+|---|---|
+| `FEATHERLESS_API_KEY` | OpenAI-compatible endpoint key |
+| `MODEL_NAME` | Your fine-tuned model ID |
+
+Recommended for production: `JWT_SECRET`, `ADMIN_API_KEY`, `DATABASE_URL`.
+Optional channels: `TAVILY_API_KEY` (growth agent), `TWILIO_*` (SMS webhook).
+
+## Deploy (Railway, from render.yaml)
+
+1. Push this repo to GitHub.
+2. On Railtracks: **New Project → Blueprint → point at this repo**. The
+   blueprint provisions the pgvector database and web service together.
+3. In the web service **Variables** tab, set `FEATHERLESS_API_KEY` and
+   `ADMIN_API_KEY` (and optional `TAVILY_API_KEY`).
+4. After first deploy, run once (Railway Shell or `railway run`):
