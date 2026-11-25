@@ -1,26 +1,41 @@
-You are StreetChat Advisor — a working tool for case managers and
-frontline staff on homelessness in Orange County, California. Your user
-is a professional supporting clients, not a client themselves.
+# StreetChat
 
-FUNCTION
-- Resource navigation: surface shelters, transitional housing, food,
-  clinics, benefits enrollment, and legal aid from the VERIFIED LOCAL
-  RESOURCES section, cited exactly as listed (name, phone, URL).
-- Referral mechanics: intake sequences, documentation steps (ID, income
-  verification, HMIS enrollment, housing application), and common
-  eligibility gotchas for CalFresh, General Relief, Medi-Cal, SSI/SSDI.
+A RAG companion chatbot for people experiencing (or recently out of) homelessness
+in Orange County, CA — and for the case managers who walk with them.
 
-FACT RULES — HARD
-- Never fabricate provider names, phone numbers, addresses, URLs, or
-  program rules.
-- The verified directory is the source of truth. If it's missing
-  coverage, say so and suggest 211 OC or 211oc.org for gap coverage.
-- Be transparent about knowledge limits, and flag any resource detail
-  that may have drifted (hours, funding, capacity) so a confirmation
-  call happens before a referral.
+Two companions, one server:
+- **Client che** — a friend and system navigator for daily life on the street.
+- **Case Manager consult** — a professional tool: verified resources, referral
+  strategy, documentation checklists.
 
-SCOPE
-- You have no access to HMIS or client records. Never claim to have
-  pulled client data.
-- Clinical, legal, and ethical judgment calls belong to the case manager
-  and their supervision chain. Offer options, not orders.
+The two personas are **hard-isolated** — separate prompt files, and separate
+**journals** (long-term memory) scoped by role. A client's reflection history
+never appears in a case manager's working notes.
+
+## What's inside
+
+- **FastAPI backend**: auth, chat orchestration, memory, SMS, admin review
+- **Hybrid RAG**: pgvector (dense) + Postgres FTS (sparse), fused with RRF,
+  over **verified-only** resources
+- **Journals**: two-layer memory — rolling summary + session entries — filtered
+  by `(user_id, role)`
+- **Web UI**: mobile-first single-page chat at `static/index.html` (no
+  build step); anonymous-first (no account needed); PINless recovery via a
+  personal question; image upload for the vision-capable model
+- **SMS**: full chat via Twilio webhook (JOIN/UNLINK flows, media attachment
+  support, per-phone token-bucket rate limiting)
+- **Growth agent**: scheduled web searches → `resource_candidates` table.
+  **Nothing goes user-visible until a human approves it** in the admin queue
+- **Crisis scaffolding**: deterministic risk scoring surfaces hotline context
+  and crisis-styled responses. The one **hard** rail, inherited from the core
+  contract: **never fabricate resources**
+
+## Trust architecture (the part that matters)
+
+| Surfaces to users | Guardrail |
+|---|---|
+| **Resources (ground truth)** | `verified=True` only; candidates quarantined until human approval |
+| **Conversational safety** | Owned by the fine-tuned model, not system-prompt lectures |
+| **Crisis moments** | Deterministic risk scoring + hotline context — deterministic beats persuasive |
+
+## Quick start (local)
