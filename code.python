@@ -1,1 +1,59 @@
-"""StreetChat — RAG companion for people experiencing homelessness in OC."""
+"""Central settings, loaded from environment / .env via pydantic-settings."""
+from __future__ import annotations
+
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    database_url: str = "sqlite:///./streetchat.db"
+    jwt_secret: str = "dev-only-insecure-secret"
+    jwt_expire_days: int = 7
+
+    # LLM (Featherless — OpenAI-compatible)
+    featherless_api_key: str = ""
+    featherless_base_url: str = "https://api.featherless.ai/v1"
+    model_name: str = "your-finetune"
+
+    # Admin
+    admin_api_key: str = ""
+
+    # Growth agent (web search)
+    tavily_api_key: str = ""
+    growth_enabled: bool = False
+
+    # SMS (Twilio)
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
+    twilio_from_number: str = ""
+    sms_rate_limit_per_minute: int = 6
+
+    # RAG / embeddings
+    embeddings_enabled: bool = True
+
+    # Deterministic risk scoring
+    risk_threshold: float = 70.0
+
+    @field_validator("database_url")
+    @classmethod
+    def _normalize_db_url(cls, v: str) -> str:
+        """Neon/Railway/Heroku hand you postgres:// or postgresql://; SQLAlchemy
+        needs an explicit psycopg3 driver. Empty value falls back to local sqlite."""
+        if not v:
+            return "sqlite:///./streetchat.db"
+        if v.startswith("postgres://"):
+            v = "postgresql://" + v[len("postgres://"):]
+        if v.startswith("postgresql://") and "+psycopg" not in v:
+            v = "postgresql+psycopg://" + v[len("postgresql://"):]
+        return v
+
+    @field_validator("jwt_secret")
+    @classmethod
+    def _jwt_secret_dev_fallback(cls, v: str) -> str:
+        # Empty value in a copied .env.example shouldn't brick auth in dev.
+        return v if v else "dev-only-insecure-secret"
+
+
+settings = Settings()
