@@ -1,17 +1,79 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String
-from sqlalchemy.orm import Mapped, mapped_column
-
-from app.database import Base, utcnow
+from pydantic import BaseModel, ConfigDict, Field
 
 
-class UserChannel(Base):
-    """SMS is a channel, not an identity: phone numbers link to accounts and
-    can be re-linked when numbers change."""
-    __tablename__ = "user_channels"
+class RegisterRequest(BaseModel):
+    username: str = Field(min_length=2, max_length=64)
+    password: str = Field(min_length=4, max_length=128)
+    recovery_question: str = Field(min_length=1, max_length=256)
+    recovery_answer: str = Field(min_length=1, max_length=256)
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
-    phone: Mapped[str] = mapped_column(String(32), unique=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class RecoverStartRequest(BaseModel):
+    username: str
+
+
+class RecoverFinishRequest(BaseModel):
+    username: str
+    answer: str
+    new_password: str = Field(min_length=4, max_length=128)
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=8000)
+    role: str = "client"  # "client" | "case_manager"
+
+
+class ImageChatRequest(BaseModel):
+    message: str = Field(default="", max_length=8000)
+    image_base64: str
+    media_type: str  # e.g. "image/jpeg"
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    crisis: bool
+    dv: bool
+    tags: list[str]
+    risk_score: float
+    identified: bool
+
+
+class ResourceOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    description: str | None = None
+    address: str | None = None
+    city: str | None = None
+    phone: str | None = None
+    url: str | None = None
+    hours: str | None = None
+    eligibility: str | None = None
+    service_types: list | None = None
+    source_url: str | None = None
+    verified: bool
+
+
+class CandidateOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    description: str | None = None
+    url: str | None = None
+    source_url: str | None = None
+    status: str
+    created_at: datetime
