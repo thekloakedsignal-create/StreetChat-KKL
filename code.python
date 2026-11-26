@@ -1,17 +1,21 @@
-"""Table registry. Imported by scripts/init_db.py and startup so Base.metadata is complete."""
-from app.models.candidate import ResourceCandidate
-from app.models.channel import UserChannel
-from app.models.conversation import ConversationMessage
-from app.models.journal import JournalEntry, JournalSummary
-from app.models.resource import Resource
-from app.models.user import User
+from datetime import datetime
 
-__all__ = [
-    "ResourceCandidate",
-    "UserChannel",
-    "ConversationMessage",
-    "JournalEntry",
-    "JournalSummary",
-    "Resource",
-    "User",
-]
+from sqlalchemy import Boolean, DateTime, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.database import Base, utcnow
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(256))
+    recovery_question: Mapped[str] = mapped_column(String(256), default="")
+    # recovery answers are normalized (lowercased, whitespace-collapsed) then
+    # hashed exactly like passwords — no email/phone reset channel exists here
+    recovery_answer_hash: Mapped[str] = mapped_column(String(256), default="")
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
