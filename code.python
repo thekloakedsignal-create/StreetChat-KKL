@@ -1,79 +1,51 @@
-from datetime import datetime
+"""Password hashing (stdlib pbkdf2 — no native deps) and JWT issue/verify."""
+from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+import hashlib
+import hmac
+import secrets
+from datetime import datetime, timedelta, timezone
 
+import jwt
 
-class RegisterRequest(BaseModel):
-    username: str = Field(min_length=2, max_length=64)
-    password: str = Field(min_length=4, max_length=128)
-    recovery_question: str = Field(min_length=1, max_length=256)
-    recovery_answer: str = Field(min_length=1, max_length=256)
+from app.config import settings
 
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
+_ITERATIONS = 120_000  # ~50-100ms on modest hardware; raises attacker cost, user won't notice
 
 
-class RecoverStartRequest(BaseModel):
-    username: str
+def hash_password(password: str, salt: str | None = None) -> str:
+    salt = salt or secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), _ITERATIONS)
+    return f"{salt}${dk.hex()}"
 
 
-class RecoverFinishRequest(BaseModel):
-    username: str
-    answer: str
-    new_password: str = Field(min_length=4, max_length=128)
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        salt, _ = stored.split("$", 1)
+    except ValueError:
+        return False
+    return hmac.compare_digest(hash_password(password, salt), stored)
 
 
-class ChatRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=8000)
-    role: str = "client"  # "client" | "case_manager"
+def normalize_answer(answer: str) -> str:
+    """Recovery answers: case- and whitespace-insensitive. A human types
+    '  MAIN street ' and means 'main street'."""
+    return " ".join(answer.lower().split())
 
 
-class ImageChatRequest(BaseModel):
-    message: str = Field(default="", max_length=8000)
-    image_base64: str
-    media_type: str  # e.g. "image/jpeg"
+def create_access_token(user_id: int) -> str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(user_id),
+        "iat": now,
+        "exp": now + timedelta(days=settings.jwt_expire_days),
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
 
 
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-
-
-class ChatResponse(BaseModel):
-    reply: str
-    crisis: bool
-    dv: bool
-    tags: list[str]
-    risk_score: float
-    identified: bool
-
-
-class ResourceOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    name: str
-    description: str | None = None
-    address: str | None = None
-    city: str | None = None
-    phone: str | None = None
-    url: str | None = None
-    hours: str | None = None
-    eligibility: str | None = None
-    service_types: list | None = None
-    source_url: str | None = None
-    verified: bool
-
-
-class CandidateOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    name: str
-    description: str | None = None
-    url: str | None = None
-    source_url: str | None = None
-    status: str
-    created_at: datetime
+def decode_token(token: str) -> int | None:
+    try:
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
+        return int(payload["sub"])
+    except (jwt.PyJWTError, KeyError, ValueError):
+        return None
