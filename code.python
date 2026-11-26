@@ -1,37 +1,85 @@
-"""Cached reads from prompts/*.md. Prompts are human-edited product copy, so a
-missing file degrades to '' — the app runs and the model just gets less context.
-Nothing in the codebase loads suffix_crisis.md; crisis handling is flags, not lectures.
+"""Chat pipeline. The persona is in the fine-tune's weights — this module
+never tells the model how to talk. It only injects per-request dynamic
+context: journal memory, verified RAG resources, and (on suicide/self-harm
+language only) a canonical crisis-line reference. Anonymous sessions touch
+no tables.
 """
-from functools import lru_cache
-from pathlib import Path
+from __future__ import annotations
 
-_PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+from sqlalchemy.orm import Session
 
+from app.clients import featherless
+from app.models.conversation import ConversationMessage
+from app.models.user import User
+from app.services import journals, retrieval, risk_scoring
 
-@lru_cache(maxsize=32)
-def _read(name: str) -> str:
-    try:
-        return (_PROMPTS_DIR / name).read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
+_VALID_ROLES = ("client", "case_manager")
 
 
-def _first(*names: str) -> str:
-    # tolerate reasonable filename drift in the prompts/ directory
-    for name in names:
-        text = _read(name)
-        if text:
-            return text
-    return ""
+def process_message(
+    db: Session,
+    message: str,
+    user_or_none: User | None,
+    role: str = "client",
+    channel: str = "web",
+    image_base64: str | None = None,
+    media_type: str | None = None,
+) -> dict:
+    if role not in _VALID_ROLES:
+        role = "client"
+    user = user_or_none
 
+    risk = risk_scoring.score_risk(message)
+    memory = journals.get_memory_block(db, user.id, role) if user else ""
+    rag = retrieval.build_rag_context(db, message)
 
-def client_system_prompt() -> str:
-    return _first("persona_client.md", "client.md", "client_persona.md")
+    # dynamic context only — no persona, no tone instructions, no channel lectures
+    context_parts = []
+    if memory:
+        context_parts.append(memory)
+    if rag:
+        context_parts.append(rag)
+    if risk.get("hotline"):
+        context_parts.append(f"CRISIS LINES (for your info, use only if natural): {risk['hotline']}")
 
+    messages: list[dict] = []
+    if context_parts:
+        messages.append({"role": "system", "content": "\n\n".join(context_parts)})
 
-def casemanager_system_prompt() -> str:
-    return _first("persona_casemanager.md", "casemanager.md", "case_manager.md")
+    if user:
+        history = (
+            db.query(ConversationMessage)
+            .filter_by(user_id=user.id, role_scope=role)
+            .order_by(ConversationMessage.created_at.desc())
+            .limit(6)
+            .all()
+        )
+        for h in reversed(history):
+            messages.append({"role": h.role, "content": h.content})
 
+    if image_base64 and media_type:
+        user_content = [
+            {"type": "text", "text": message},
+            {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{image_base64}"}},
+        ]
+    else:
+        user_content = message
+    messages.append({"role": "user", "content": user_content})
 
-def sms_suffix() -> str:
-    return _first("suffix_sms.md", "sms_suffix.md", "sms.md")
+    reply = featherless.chat(messages=messages)
+
+    if user:
+        # conversation rows store text only — images are transient, never persisted
+        db.add(ConversationMessage(user_id=user.id, role_scope=role, role="user", content=message))
+        db.add(ConversationMessage(user_id=user.id, role_scope=role, role="assistant", content=reply))
+        journals.record_journal_entry(db, user.id, role, message, reply)
+        db.commit()
+
+    return {
+        "reply": reply,
+        "crisis": risk["crisis_triggered"],
+        "dv": risk["dv_flagged"],
+        "tags": risk["tags"],
+        "risk_score": risk["score"],
+        "identified": user is not None,
+    }
