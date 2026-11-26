@@ -1,49 +1,17 @@
-"""Engine, session factory, Base, hospitable to both Neon Postgres and sqlite."""
-from __future__ import annotations
+"""Table registry. Imported by scripts/init_db.py and startup so Base.metadata is complete."""
+from app.models.candidate import ResourceCandidate
+from app.models.channel import UserChannel
+from app.models.conversation import ConversationMessage
+from app.models.journal import JournalEntry, JournalSummary
+from app.models.resource import Resource
+from app.models.user import User
 
-from contextlib import contextmanager
-from datetime import datetime, timezone
-from typing import Iterator
-
-from sqlalchemy import create_engine
-from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
-
-from app.config import settings
-
-# check_same_thread is a sqlite-only arg; passing it to psycopg would error.
-_connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
-
-engine = create_engine(settings.database_url, connect_args=_connect_args, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
-
-
-class Base(DeclarativeBase):
-    pass
-
-
-def utcnow() -> datetime:
-    """Naive UTC — tz-consistent across sqlite (naive) and Postgres."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
-@contextmanager
-def get_db_ctx() -> Iterator[Session]:
-    """Script/test-style session: commits on clean exit, rolls back on error."""
-    db = SessionLocal()
-    try:
-        yield db
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
-
-
-def get_db() -> Iterator[Session]:
-    """FastAPI dependency — request-scoped session."""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+__all__ = [
+    "ResourceCandidate",
+    "UserChannel",
+    "ConversationMessage",
+    "JournalEntry",
+    "JournalSummary",
+    "Resource",
+    "User",
+]
