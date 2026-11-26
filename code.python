@@ -1,13 +1,1 @@
-system_parts = [
-        casemanager_system_prompt() if role == "case_manager" else client_system_prompt()
-    ]
-    if memory:
-        system_parts.append(memory)
-    if rag:
-        system_parts.append(rag)
-    if channel == "sms":
-        system_parts.append(sms_suffix())
-    if risk.get("hotline"):
-        system_parts.append(f"CRISIS LINES (for your info, use only if natural): {risk['hotline']}")
-
-    system_parts = [p for p in system_parts if p]
+"""StreetChat — RAG companion for people experiencing homelessness in OC."""
