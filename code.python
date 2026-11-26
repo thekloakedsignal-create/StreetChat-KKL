@@ -1,21 +1,32 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, String
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base, utcnow
 
 
-class User(Base):
-    __tablename__ = "users"
+class JournalEntry(Base):
+    """One remembered moment from a session. role_scope isolates client vs
+    case_manager memory for the same human."""
+    __tablename__ = "journal_entries"
+    __table_args__ = (Index("ix_journal_user_scope", "user_id", "role_scope"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    password_hash: Mapped[str] = mapped_column(String(256))
-    recovery_question: Mapped[str] = mapped_column(String(256), default="")
-    # recovery answers are normalized (lowercased, whitespace-collapsed) then
-    # hashed exactly like passwords — no email/phone reset channel exists here
-    recovery_answer_hash: Mapped[str] = mapped_column(String(256), default="")
-    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    role_scope: Mapped[str] = mapped_column(String(32), default="client")
+    content: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class JournalSummary(Base):
+    """Rolling long-term memory: one row per (user, role_scope)."""
+    __tablename__ = "journal_summaries"
+    __table_args__ = (UniqueConstraint("user_id", "role_scope", name="uq_summary_user_scope"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    role_scope: Mapped[str] = mapped_column(String(32), default="client")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    entry_count_at_update: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
