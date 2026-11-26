@@ -1,41 +1,37 @@
-"""FastAPI dependencies: auth (required/optional) and the admin-key gate."""
-from __future__ import annotations
+"""Cached reads from prompts/*.md. Prompts are human-edited product copy, so a
+missing file degrades to '' — the app runs and the model just gets less context.
+Nothing in the codebase loads suffix_crisis.md; crisis handling is flags, not lectures.
+"""
+from functools import lru_cache
+from pathlib import Path
 
-import hmac
-
-from fastapi import Depends, Header, HTTPException
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy.orm import Session
-
-from app.config import settings
-from app.database import get_db
-from app.models.user import User
-from app.security import decode_token
-
-_bearer = HTTPBearer(auto_error=False)  # never 403s itself — anonymous chat is a feature
+_PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 
-def get_current_user_optional(
-    creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
-    db: Session = Depends(get_db),
-) -> User | None:
-    if creds is None:
-        return None
-    user_id = decode_token(creds.credentials)
-    if user_id is None:
-        return None
-    return db.get(User, user_id)
+@lru_cache(maxsize=32)
+def _read(name: str) -> str:
+    try:
+        return (_PROMPTS_DIR / name).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
-def get_current_user(user: User | None = Depends(get_current_user_optional)) -> User:
-    if user is None:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    return user
+def _first(*names: str) -> str:
+    # tolerate reasonable filename drift in the prompts/ directory
+    for name in names:
+        text = _read(name)
+        if text:
+            return text
+    return ""
 
 
-def verify_admin_key(x_admin_key: str = Header(alias="X-Admin-Key")) -> None:
-    """Missing header → FastAPI 422. Empty server key (unconfigured admin
-    surface → fail closed) or mismatch → 401."""
-    expected = settings.admin_api_key
-    if not expected or not hmac.compare_digest(x_admin_key, expected):
-        raise HTTPException(status_code=401, detail="Invalid admin key")
+def client_system_prompt() -> str:
+    return _first("persona_client.md", "client.md", "client_persona.md")
+
+
+def casemanager_system_prompt() -> str:
+    return _first("persona_casemanager.md", "casemanager.md", "case_manager.md")
+
+
+def sms_suffix() -> str:
+    return _first("suffix_sms.md", "sms_suffix.md", "sms.md")
